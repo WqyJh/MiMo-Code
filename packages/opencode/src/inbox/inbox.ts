@@ -106,7 +106,14 @@ export const layer: Layer.Layer<
       const promptRef = sessionPromptRef.current
       if (promptRef) {
         yield* promptRef
-          .loop({ sessionID: input.receiverSessionID, agentID: input.receiverActorID })
+          .loop({
+            sessionID: input.receiverSessionID,
+            agentID: input.receiverActorID,
+            // Woken turns notify their parent on completion. The spawn turn goes
+            // through SessionPrompt.prompt (no flag) so forkWork.notify remains
+            // the sole notifier for turn 1 — no double-notify.
+            notifyParentOnComplete: true,
+          })
           .pipe(Effect.ignore, Effect.forkIn(scope))
       } else {
         // Test fixtures / renderer-only paths can run without SessionPrompt.

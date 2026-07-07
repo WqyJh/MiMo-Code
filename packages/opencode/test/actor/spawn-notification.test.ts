@@ -190,7 +190,7 @@ function makeLayer() {
       Layer.provideMerge(taskRegistry),
       Layer.provide(TaskRegistry.defaultLayer),
     Layer.provide(SchedulerDefaultLayer),
-      Layer.provide(inboxLayer),
+      Layer.provideMerge(inboxLayer),
     ),
   ).pipe(Layer.provide(summary))
 }
@@ -391,6 +391,165 @@ describe("Actor.spawn inbox notifications (Plan 3 / Task 2)", () => {
         )
 
         expect(rows.length).toBe(0)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  )
+
+  // T12: a persistent background PEER that finishes a *woken* (inbox-driven)
+  // turn must notify its parent exactly once — forkWork.notify only covers the
+  // spawn turn, so later woken turns would otherwise go idle silently.
+  it.live("background peer finishing a woken turn sends exactly one actor_notification to parent", () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const actor = yield* Actor.Service
+        const session = yield* Session.Service
+        const inbox = yield* Inbox.Service
+
+        const parent = yield* session.create({
+          title: "notification-test-woken-peer",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        // One response for the spawn turn, one for the woken turn.
+        yield* llm.text("**Status**: success\n**Summary**: spawn turn")
+        yield* llm.text("**Status**: success\n**Summary**: woken turn")
+
+        const result = yield* actor.spawn({
+          mode: "peer",
+          sessionID: parent.id,
+          agentType: "build",
+          task: "peer that will be woken",
+          description: "woken peer task",
+          context: "none",
+          tools: ["read"],
+          background: true,
+          model: ref,
+        })
+
+        // Spawn turn completes → forkWork.notify writes the FIRST notification.
+        yield* Deferred.await(result.outcome)
+
+        const inboxRows = (agentID: string) =>
+          Effect.sync(() =>
+            Database.use((db) =>
+              db
+                .select()
+                .from(InboxTable)
+                .where(
+                  and(
+                    eq(InboxTable.receiver_session_id, parent.id),
+                    eq(InboxTable.receiver_actor_id, agentID),
+                  ),
+                )
+                .all(),
+            ),
+          )
+
+        // Clear the spawn-turn notification so we can assert the woken turn adds
+        // exactly one more.
+        yield* Effect.sync(() =>
+          Database.use((db) => db.delete(InboxTable).where(eq(InboxTable.receiver_session_id, parent.id)).run()),
+        )
+
+        // Wake the peer with an inbox message. This drives a woken turn via
+        // SessionPrompt.loop({ notifyParentOnComplete: true }).
+        yield* inbox
+          .send({
+            receiverSessionID: result.sessionID,
+            receiverActorID: result.actorID,
+            senderSessionID: parent.id,
+            senderActorID: "main",
+            content: "please do more work",
+          })
+          .pipe(Effect.orDie)
+
+        // Poll the parent inbox until the woken-turn notification arrives.
+        const rows = yield* Effect.gen(function* () {
+          for (let i = 0; i < 200; i++) {
+            const r = yield* inboxRows("main")
+            if (r.length > 0) return r
+            yield* Effect.sleep("25 millis")
+          }
+          return yield* inboxRows("main")
+        })
+
+        expect(rows.length).toBe(1)
+        expect(rows[0].type).toBe("actor_notification")
+        const content = rows[0].content as { text?: string }
+        expect(content.text).toContain("<actor-notification>")
+        expect(content.text).toContain("woken peer task")
+        expect(content.text).toContain("completed")
+
+        yield* actor.cancel(result.sessionID, result.actorID, "forced").pipe(Effect.ignore)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  )
+
+  // T12 gate: a SYSTEM subagent agentType (checkpoint-writer) spawned as a peer
+  // must NOT notify on a woken turn — SYSTEM_SPAWNED_AGENT_TYPES are excluded.
+  it.live("system-spawned peer finishing a woken turn sends no notification", () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const actor = yield* Actor.Service
+        const session = yield* Session.Service
+        const inbox = yield* Inbox.Service
+
+        const parent = yield* session.create({
+          title: "notification-test-woken-system-peer",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        yield* llm.text("spawn turn output")
+        yield* llm.text("woken turn output")
+
+        const result = yield* actor.spawn({
+          mode: "peer",
+          sessionID: parent.id,
+          agentType: "checkpoint-writer",
+          task: "system peer that will be woken",
+          description: "woken system peer task",
+          context: "none",
+          tools: ["read"],
+          background: true,
+          model: ref,
+        })
+
+        yield* Deferred.await(result.outcome)
+
+        // checkpoint-writer is gated in forkWork.notify too, so the inbox should
+        // already be empty; clear defensively then wake.
+        yield* Effect.sync(() =>
+          Database.use((db) => db.delete(InboxTable).where(eq(InboxTable.receiver_session_id, parent.id)).run()),
+        )
+
+        yield* inbox
+          .send({
+            receiverSessionID: result.sessionID,
+            receiverActorID: result.actorID,
+            senderSessionID: parent.id,
+            senderActorID: "main",
+            content: "please do more work",
+          })
+          .pipe(Effect.orDie)
+
+        // Give the woken turn ample time to run and (not) notify.
+        yield* Effect.sleep("500 millis")
+
+        const rows = yield* Effect.sync(() =>
+          Database.use((db) =>
+            db
+              .select()
+              .from(InboxTable)
+              .where(eq(InboxTable.receiver_session_id, parent.id))
+              .all(),
+          ),
+        )
+
+        expect(rows.length).toBe(0)
+
+        yield* actor.cancel(result.sessionID, result.actorID, "forced").pipe(Effect.ignore)
       }),
       { git: true, config: providerCfg },
     ),

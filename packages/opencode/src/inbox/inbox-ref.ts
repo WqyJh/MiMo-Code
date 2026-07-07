@@ -16,7 +16,13 @@ import type { MessageV2 } from "@/session/message-v2"
 import type { Interface as InboxInterface } from "./inbox"
 
 export interface SessionPromptLoopRef {
-  loop: (input: { sessionID: SessionID; agentID: string }) => Effect.Effect<MessageV2.WithParts>
+  loop: (input: {
+    sessionID: SessionID
+    agentID: string
+    // The inbox wake path sets this so a persistent background peer that
+    // finishes a woken turn notifies its parent (see prompt.ts runLoop terminal).
+    notifyParentOnComplete?: boolean
+  }) => Effect.Effect<MessageV2.WithParts>
 }
 
 export const sessionPromptRef: { current: SessionPromptLoopRef | undefined } = {
