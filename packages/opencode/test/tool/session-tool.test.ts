@@ -303,6 +303,10 @@ describe("session tool", () => {
         const result = yield* tool.execute({ operation: { action: "list" } }, ctx(parent.id))
 
         expect(result.title).toBe("Child sessions: 2")
+        // The output now leads with a counted summary line covering all buckets.
+        expect(result.output).toContain("Child sessions: 2 total —")
+        expect(result.output).toContain("running")
+        expect(result.output).toContain("idle")
         expect(result.output).toContain(idA)
         expect(result.output).toContain(idB)
         // create overwrites spawnPeer's default `${agentType}: ${task}` title
@@ -312,6 +316,113 @@ describe("session tool", () => {
         // agent (the NL "mode") is surfaced from the actor row.
         expect(result.output).toContain("build")
         expect(result.output).toContain("compose")
+      }),
+    ),
+  )
+
+  it.live("list groups children by status with counts and excludes system subagents", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+
+        // A running peer (freshly created → status pending/running).
+        const running = yield* tool.execute(
+          { operation: { action: "create", task: "work", mode: "build", title: "Runner" } },
+          ctx(parent.id),
+        )
+        const runningID = running.metadata.sessionID!
+
+        // An idle/finished peer: create it, then flip its actor row to a terminal
+        // idle with a success outcome so it lands in the "Finished / idle" bucket.
+        const idle = yield* tool.execute(
+          { operation: { action: "create", task: "done work", mode: "build", title: "Idler" } },
+          ctx(parent.id),
+        )
+        const idleID = idle.metadata.sessionID!
+        yield* actorReg.updateStatus(SessionID.make(idleID), idleID, { status: "idle", lastOutcome: "success" })
+
+        // A system subagent (checkpoint-writer): parented to us but must NOT appear.
+        const sub = yield* sessions.create({ title: "checkpoint-writer: T1", parentID: parent.id })
+        yield* actorReg.register({
+          sessionID: sub.id,
+          actorID: sub.id,
+          mode: "subagent",
+          agent: "checkpoint-writer",
+          description: "checkpoint",
+          contextMode: "full",
+          background: true,
+          lifecycle: "ephemeral",
+        })
+
+        const result = yield* tool.execute({ operation: { action: "list" } }, ctx(parent.id))
+
+        // Total counts only the two real peers; subagent excluded.
+        expect(result.title).toBe("Child sessions: 2")
+        expect(result.output).toContain("Child sessions: 2 total — 1 running, 1 idle")
+
+        // Grouped section headings with per-group counts.
+        expect(result.output).toContain("In progress (running/pending) (1):")
+        expect(result.output).toContain("Finished / idle (1):")
+
+        // Both real peers appear, under their respective groups.
+        expect(result.output).toContain(runningID)
+        expect(result.output).toContain("Runner")
+        expect(result.output).toContain(idleID)
+        expect(result.output).toContain("Idler")
+
+        // The system subagent is filtered out entirely.
+        expect(result.output).not.toContain(sub.id)
+        expect(result.output).not.toContain("checkpoint-writer")
+      }),
+    ),
+  )
+
+  it.live("list excludes subagent sessions (checkpoint-writer) parented to the orchestrator", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+
+        // A real peer child — this SHOULD appear in the listing.
+        const peer = yield* tool.execute(
+          { operation: { action: "create", task: "real work", mode: "build", title: "Peer" } },
+          ctx(parent.id),
+        )
+        const peerID = peer.metadata.sessionID!
+
+        // A subagent child: same parent linkage (checkpoint-writer / dream /
+        // distill and read-only fork children are all parented to us via the
+        // Session row), but registered as mode:"subagent" with a system agent.
+        // This must NOT appear in the orchestrator's child listing.
+        const sub = yield* sessions.create({ title: "checkpoint-writer: T1", parentID: parent.id })
+        yield* actorReg.register({
+          sessionID: sub.id,
+          actorID: sub.id,
+          mode: "subagent",
+          agent: "checkpoint-writer",
+          description: "checkpoint",
+          contextMode: "full",
+          background: true,
+          lifecycle: "ephemeral",
+        })
+
+        const result = yield* tool.execute({ operation: { action: "list" } }, ctx(parent.id))
+
+        // Only the peer is listed; the checkpoint-writer subagent is filtered.
+        expect(result.title).toBe("Child sessions: 1")
+        expect(result.output).toContain(peerID)
+        expect(result.output).toContain("Peer")
+        expect(result.output).not.toContain(sub.id)
+        expect(result.output).not.toContain("checkpoint-writer")
       }),
     ),
   )

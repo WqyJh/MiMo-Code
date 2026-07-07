@@ -525,14 +525,54 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
         const children = yield* sessions.children(ctx.sessionID as SessionID)
         if (children.length === 0)
           return { title: "Child sessions: 0", output: "No child sessions.", metadata: {} as Metadata }
-        const lines = yield* Effect.forEach(children, (child) =>
-          actorReg.get(child.id, child.id).pipe(
-            Effect.map((actor) =>
-              `${child.id} — ${child.title} — ${actor?.agent ?? "?"} — ${actor?.status ?? "unknown"}`,
-            ),
-          ),
+        const peers = yield* Effect.forEach(children, (child) =>
+          actorReg.get(child.id, child.id).pipe(Effect.map((actor) => ({ child, actor }))),
         )
-        return { title: `Child sessions: ${children.length}`, output: lines.join("\n"), metadata: {} as Metadata }
+        // The actor row's status enum is only pending|running|idle; a terminal
+        // idle carries a lastOutcome (success/failure/cancelled). Derive a
+        // display bucket from (status, lastOutcome): running/pending are live,
+        // idle+cancelled/failure are terminal-with-outcome, everything else is
+        // a plain finished/idle child. Never fabricate a state the data lacks.
+        const bucketOf = ({ actor }: (typeof peers)[number]) => {
+          if (!actor) return "idle" as const
+          if (actor.status === "running" || actor.status === "pending") return "running" as const
+          if (actor.lastOutcome === "cancelled") return "cancelled" as const
+          if (actor.lastOutcome === "failure") return "failed" as const
+          return "idle" as const
+        }
+        const tagged = peers.map((p) => ({ ...p, bucket: bucketOf(p) }))
+        const counts = {
+          running: tagged.filter((p) => p.bucket === "running").length,
+          idle: tagged.filter((p) => p.bucket === "idle").length,
+          cancelled: tagged.filter((p) => p.bucket === "cancelled").length,
+          failed: tagged.filter((p) => p.bucket === "failed").length,
+        }
+        const groups: { bucket: keyof typeof counts; heading: string }[] = [
+          { bucket: "running", heading: "In progress (running/pending)" },
+          { bucket: "idle", heading: "Finished / idle" },
+          { bucket: "failed", heading: "Failed" },
+          { bucket: "cancelled", heading: "Cancelled" },
+        ]
+        const sections = groups
+          .filter((g) => counts[g.bucket] > 0)
+          .map((g) => {
+            const lines = tagged
+              .filter((p) => p.bucket === g.bucket)
+              .map(
+                ({ child, actor }) =>
+                  `  ${child.id} — ${child.title} — ${actor?.agent ?? "?"} — ${actor?.status ?? "unknown"}`,
+              )
+            return `${g.heading} (${counts[g.bucket]}):\n${lines.join("\n")}`
+          })
+        const summary =
+          `Child sessions: ${peers.length} total — ${counts.running} running, ${counts.idle} idle` +
+          (counts.failed > 0 ? `, ${counts.failed} failed` : "") +
+          (counts.cancelled > 0 ? `, ${counts.cancelled} cancelled` : "")
+        return {
+          title: `Child sessions: ${peers.length}`,
+          output: [summary, "", ...sections].join("\n"),
+          metadata: {} as Metadata,
+        }
       }
 
       if (op.action === "cancel") {
