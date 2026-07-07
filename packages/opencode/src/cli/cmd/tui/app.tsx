@@ -418,10 +418,16 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
 
   // Orchestrator mode is GLOBALLY UNIQUE: switching INTO it (from any launch
   // directory) switches the working dir to a fixed global orchestrator workspace
-  // and lands on the single root session there (find-or-create). This guarantees
+  // and resolves the single root session there (find-or-create). This guarantees
   // there is exactly one orchestrator session regardless of where the user
   // launched, so previously-created child sessions are always reachable. Mirrors
   // dialog-worktree's switch sequence (dispose → switchDirectory → bootstrap).
+  //
+  // Crucially we do NOT route.navigate on mode entry: switching modes must not
+  // swap the view for a fresh session (that's the reported bug). Instead we
+  // stash the resolved root id in local.orchestrator so the composer submits the
+  // first message INTO it (dedupe preserved) and the view only switches after
+  // that message is sent — matching every other mode's behavior.
   let enteringOrchestrator = false
   let lastAgentName: string | undefined = undefined
   createEffect(() => {
@@ -431,7 +437,13 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     // Only act on the transition INTO orchestrator, and never re-enter while a
     // switch is already in flight. No-op entirely when the feature is off.
     if (!Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR) return
-    if (name !== "orchestrator" || prev === "orchestrator" || enteringOrchestrator) return
+    // Leaving orchestrator: drop the stashed id so a later non-orchestrator
+    // submit can never accidentally target the orchestrator root.
+    if (name !== "orchestrator") {
+      if (prev === "orchestrator") local.orchestrator.setSessionID(undefined)
+      return
+    }
+    if (prev === "orchestrator" || enteringOrchestrator) return
     enteringOrchestrator = true
     void (async () => {
       try {
@@ -445,10 +457,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
           .toSorted((a, b) => b.time.updated - a.time.updated)
           .find((x) => x.parentID === undefined)?.id
         if (existing) {
-          route.navigate({ type: "session", sessionID: existing })
+          local.orchestrator.setSessionID(existing)
         } else {
           const res = await sdk.client.session.create({})
-          if (res.data?.id) route.navigate({ type: "session", sessionID: res.data.id })
+          if (res.data?.id) local.orchestrator.setSessionID(res.data.id)
         }
       } catch (e) {
         toast.show({ message: `Failed to enter Orchestrator: ${e}`, variant: "error" })
