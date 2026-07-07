@@ -45,4 +45,32 @@ describe("orchestrator prompt", () => {
     expect(PROMPT_ORCHESTRATOR).toContain("session cancel")
     expect(PROMPT_ORCHESTRATOR).toContain("resume")
   })
+
+  test("draws the actor-vs-session line and forbids blocking on real work", () => {
+    // The orchestrator must never do real work via a BLOCKING actor subagent
+    // (`actor run`/`spawn`), and must never block its turn on any tool action.
+    // Pin the distinction + the never-block discipline so they can't regress.
+    expect(PROMPT_ORCHESTRATOR).toContain("actor")
+    expect(PROMPT_ORCHESTRATOR).toMatch(/never block|MUST NEVER block|non-blocking/i)
+    // The blocking subagent actions must be named and forbidden for real work.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/actor run|actor spawn|`actor run`/i)
+    // The legitimate non-blocking relay/nudge action must be endorsed.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/actor send|actor status/i)
+  })
+
+  test("makes isolation the default for git-repo editing children", () => {
+    // isolate:true must be the DEFAULT for children that edit files in a git
+    // repo (isolation-first), not a soft per-task judgement call.
+    expect(PROMPT_ORCHESTRATOR).toContain("isolate")
+    expect(PROMPT_ORCHESTRATOR).toMatch(/isolation-first|DEFAULT|MUST/i)
+  })
+
+  test("warns about idle-without-notification and detached-commit faults on resume", () => {
+    // A child can go idle without sending a completion notification; and a
+    // committed change can be detached from its branch ref. Pin the guidance to
+    // verify via git and merge by commit hash when the branch ref lags.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/idle/i)
+    expect(PROMPT_ORCHESTRATOR).toMatch(/notification/i)
+    expect(PROMPT_ORCHESTRATOR).toMatch(/detached|commit hash|branch ref/i)
+  })
 })
