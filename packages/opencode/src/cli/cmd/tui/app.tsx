@@ -459,6 +459,13 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
   // that message is sent — matching every other mode's behavior.
   let enteringOrchestrator = false
   let lastAgentName: string | undefined = undefined
+  // While an orchestrator dir-switch is in flight we can neither keep rendering
+  // the stale launch-dir session (blackscreen: it no longer exists after
+  // switchDirectory) NOR flash Home as an intermediate (the T50 regression). So
+  // we SUPPRESS the view for the switch window and navigate exactly ONCE at the
+  // end — directly to the resolved orchestrator session. StartupLoading already
+  // shows a spinner overlay, so the window reads as "loading", not "home".
+  const [switchingOrchestrator, setSwitchingOrchestrator] = createSignal(false)
   createEffect(() => {
     const name = local.agent.current()?.name
     const prev = lastAgentName
@@ -478,30 +485,30 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     // directory, that session will not exist once we switch the SDK to
     // orchestratorDir(). Leaving the route pointed at it makes the session
     // route's session.get fail against the new directory and blank the view
-    // (blackscreen — the T20 -c case). Return to home FIRST so the view matches
-    // the healthy fresh-orchestrator-entry state. But when we launched INSIDE
-    // the orchestrator dir (sdk.directory is already orchestratorDir(), the -s
+    // (blackscreen — the T20 -c case). We therefore SUPPRESS the view during the
+    // switch (StartupLoading overlay stands in) instead of navigating to Home —
+    // navigating to Home was the T50 fix but it flashes the Orchestrator home
+    // page before the session appears. When we launched INSIDE the orchestrator
+    // dir (sdk.directory is already orchestratorDir(), the -s
     // <orchestratorSessionID> direct-entry case), no dir switch happens: the
     // route already points at the orchestrator root session and MUST be kept —
-    // redirecting to home here is the regression. So this navigation lives
-    // inside the async block, gated by the SAME `sdk.directory !== dir` check
-    // that gates the actual switch (race-free: uses the freshly-resolved dir,
-    // not the async-populated signal).
+    // so suppression is gated by the SAME `sdk.directory !== dir` check that
+    // gates the actual switch (race-free: uses the freshly-resolved dir, not the
+    // async-populated signal).
     // A `-s <orchestratorSessionID>` launch from OUTSIDE orchestratorDir (the
     // common case: user runs `mimo -s <id>` from a project dir) navigates the
     // route to that session (app.tsx onMount) and auto-restores agent=orchestrator
     // from the session's last message. That drives us here with sdk.directory !==
-    // dir, so we navigate home before the switch (T36, to avoid the blackscreen of
-    // a stale launch-dir session). But the user explicitly asked to RESUME that
-    // session — leaving them on the blank home composer is the regression. So we
-    // remember they came in via `-s` on a session route and re-enter the resolved
-    // orchestrator root AFTER the switch+bootstrap, showing its history.
+    // dir. We suppress the view, switch+bootstrap, then navigate ONCE directly to
+    // the resolved orchestrator root — a single transition, no Home flash, no
+    // blackscreen (the root exists in the switched dir after bootstrap).
     const resumeIntoSession = args.sessionID != null && route.data.type === "session"
     void (async () => {
       try {
         const dir = await orchestratorDir()
-        if (sdk.directory !== dir) {
-          if (route.data.type === "session") route.navigate({ type: "home" })
+        const switching = sdk.directory !== dir
+        if (switching) {
+          setSwitchingOrchestrator(true)
           await sdk.client.instance.dispose().catch(() => {})
           sdk.switchDirectory(dir)
           await sync.bootstrap()
@@ -511,17 +518,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
           .find((x) => x.parentID === undefined)?.id
         if (existing) {
           local.orchestrator.setSessionID(existing)
-          // Restore the resumed view: a `-s` launch wanted to land IN the
-          // orchestrator session, not on home. Safe after bootstrap — the root
-          // now exists in the (switched) orchestratorDir.
+          // A `-s` launch wanted to land IN the orchestrator session; a plain
+          // Tab-into-orchestrator from a stale launch-dir session wanted Home
+          // (the fresh-entry state). Either way navigate exactly once, AFTER
+          // bootstrap, so the switched view resolves directly to its target with
+          // no intermediate frame — the root now exists in orchestratorDir.
           if (resumeIntoSession) route.navigate({ type: "session", sessionID: existing })
+          else if (switching) route.navigate({ type: "home" })
         } else {
           const res = await sdk.client.session.create({})
           if (res.data?.id) local.orchestrator.setSessionID(res.data.id)
+          if (switching) route.navigate({ type: "home" })
         }
       } catch (e) {
         toast.show({ message: `Failed to enter Orchestrator: ${e}`, variant: "error" })
       } finally {
+        setSwitchingOrchestrator(false)
         enteringOrchestrator = false
       }
     })()
@@ -1279,7 +1291,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       <Show when={Flag.MIMOCODE_SHOW_TTFD}>
         <TimeToFirstDraw />
       </Show>
-      <Show when={ready()}>
+      <Show when={ready() && !switchingOrchestrator()}>
         <Switch>
           <Match when={route.data.type === "home"}>
             <Home />
