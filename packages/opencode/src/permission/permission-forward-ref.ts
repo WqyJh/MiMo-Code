@@ -6,11 +6,23 @@
 // be shared process-wide.
 //
 // - grants:  parentSessionID -> Set of (childSessionID | "*"). A grant lets the
-//            orchestrator pre-authorize a forwarded ask without a human.
+//            orchestrator pre-authorize a forwarded ask without a human. This
+//            in-memory map is a fast cache; it is WRITE-THROUGH to the shared
+//            SQLite `permission_grant` table (see permission.sql.ts) so a grant
+//            survives restart AND is visible to isolated children that run in a
+//            SEPARATE PROCESS (they don't share this module singleton, but they
+//            open the same on-disk DB). grantAllowed consults the DB, not just
+//            the cache, so a child spawned AFTER the grant still sees it.
 // - pending: requestID -> which child/parent a forwarded, not-yet-resolved ask
 //            belongs to, PLUS a resolver bound to the child's own Deferred (in
 //            the child's Instance) so `session approve` can resolve it from the
 //            orchestrator's Instance and the orchestrator can drop its copy.
+
+import { Database, eq } from "../storage"
+import { PermissionGrantTable } from "./permission.sql"
+import { Log } from "../util"
+
+const log = Log.create({ service: "permission-forward-ref" })
 
 type Decision = "allow" | "deny"
 type PendingRec = {
@@ -29,18 +41,64 @@ export const forwardRef = {
     const set = grants.get(parentSessionID) ?? new Set<string>()
     set.add(target)
     grants.set(parentSessionID, set)
+    // Write-through to shared SQLite so separate-process children created later
+    // (and restarts) see this grant. Best-effort: a DB hiccup must not break the
+    // in-memory grant for same-process children.
+    try {
+      Database.use((db) =>
+        db
+          .insert(PermissionGrantTable)
+          .values({ parent_session_id: parentSessionID as any, target, created_at: Date.now() })
+          .onConflictDoNothing()
+          .run(),
+      )
+    } catch (err) {
+      log.warn("setGrant persist failed", { parentSessionID, target, err })
+    }
   },
   grantAllowed(parentSessionID: string, childSessionID: string): boolean {
+    // In-memory fast path (same-process parent that just granted).
     const set = grants.get(parentSessionID)
-    if (!set) return false
-    return set.has(childSessionID) || set.has("*")
+    if (set && (set.has(childSessionID) || set.has("*"))) return true
+    // Cross-process / post-restart path: consult the shared DB. A child in its
+    // own Instance/process has no in-memory grant but must honor a parent grant
+    // that was persisted, including "*" matching a child created after the grant.
+    try {
+      return Database.use((db) => {
+        const rows = db
+          .select({ target: PermissionGrantTable.target })
+          .from(PermissionGrantTable)
+          .where(eq(PermissionGrantTable.parent_session_id, parentSessionID as any))
+          .all()
+        return rows.some((r) => r.target === childSessionID || r.target === "*")
+      })
+    } catch (err) {
+      log.warn("grantAllowed lookup failed", { parentSessionID, childSessionID, err })
+      return false
+    }
   },
   clearGrantsForParent(parentSessionID: string) {
     grants.delete(parentSessionID)
+    try {
+      Database.use((db) =>
+        db.delete(PermissionGrantTable).where(eq(PermissionGrantTable.parent_session_id, parentSessionID as any)).run(),
+      )
+    } catch (err) {
+      log.warn("clearGrantsForParent persist failed", { parentSessionID, err })
+    }
   },
   clearGrantsForChild(childSessionID: string) {
     for (const set of grants.values()) set.delete(childSessionID)
     for (const [id, rec] of pending) if (rec.childSessionID === childSessionID) pending.delete(id)
+    // Remove any persisted specific-child grant (never touches "*" wildcards,
+    // which belong to the parent and outlive an individual child).
+    try {
+      Database.use((db) =>
+        db.delete(PermissionGrantTable).where(eq(PermissionGrantTable.target, childSessionID)).run(),
+      )
+    } catch (err) {
+      log.warn("clearGrantsForChild persist failed", { childSessionID, err })
+    }
   },
   addPending(requestID: string, rec: PendingRec) {
     pending.set(requestID, rec)
