@@ -1533,6 +1533,22 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     return props.message.finish && props.message.finish !== "tool-calls"
   })
 
+  // The completion footer (▣ Agent · model · duration) must render exactly once
+  // per turn. A turn can produce several assistant messages: mid-loop ones finish
+  // with "tool-calls", the closing one finishes with "stop". In Orchestrator mode
+  // the turn characteristically ends on a "tool-calls" message (spawning
+  // subagents / handing off) that trails the final "stop" message — so `props.last`
+  // and `final()` land on two different messages and BOTH draw a footer (the stop
+  // one with a duration, the trailing tool-calls one without). Suppress the footer
+  // for a trailing message that already finished with "tool-calls"; still show it
+  // while a last message is streaming (finish undefined) or for the final/aborted
+  // message, which preserves non-orchestrator behavior.
+  const showFooter = createMemo(() => {
+    if (props.message.error?.name === "MessageAbortedError") return true
+    if (final()) return true
+    return props.last && props.message.finish !== "tool-calls"
+  })
+
   const duration = createMemo(() => {
     if (!final()) return 0
     if (!props.message.time.completed) return 0
@@ -1614,7 +1630,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
         <ErrorBlock error={props.message.error!} />
       </Show>
       <Switch>
-        <Match when={props.last || final() || props.message.error?.name === "MessageAbortedError"}>
+        <Match when={showFooter()}>
           <box paddingLeft={3} flexDirection="row" justifyContent="space-between" marginTop={1}>
             <text>
               <span
