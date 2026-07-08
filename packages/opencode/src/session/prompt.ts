@@ -2791,6 +2791,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           step++
+          // Per-step turn heartbeat: only writer of turn_count; advances last_turn_time/time_updated so the orchestrator can tell progressing children from stalled ones. Safe 0-row no-op when no registry row exists.
+          yield* actorRegistry.updateTurn(sessionID, resolvedAgentID).pipe(Effect.ignore)
           if (step === 1)
             yield* title({
               session,
