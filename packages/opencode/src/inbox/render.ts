@@ -21,11 +21,13 @@ export function renderInboxRow(row: InboxRow): string {
 export function renderActorNotification(event: {
   actorID: string
   description: string
-  status: "completed" | "failed" | "cancelled"
+  status: "completed" | "failed" | "cancelled" | "stalled"
   result?: string
   error?: string
   reportedStatus?: string
   reportedSummary?: string
+  // For a stalled notification: how long (ms) since the child's last turn advanced.
+  stalledForMs?: number
 }): string {
   const header = `Background actor "${event.description}" (actor_id: ${event.actorID})`
   if (event.status === "completed") {
@@ -35,6 +37,11 @@ export function renderActorNotification(event: {
   }
   if (event.status === "failed") {
     return `<actor-notification>\n${header} failed.\nError: ${event.error ?? "unknown"}\n</actor-notification>`
+  }
+  if (event.status === "stalled") {
+    const forLine =
+      event.stalledForMs !== undefined ? ` (no turn advance for ${Math.floor(event.stalledForMs / 1000)}s)` : ""
+    return `<actor-notification>\n${header} appears stalled${forLine}. It is still running but has made no progress. Consider checking on it, sending it a nudge, or cancelling it.\n</actor-notification>`
   }
   return `<actor-notification>\n${header} was cancelled.\n</actor-notification>`
 }
