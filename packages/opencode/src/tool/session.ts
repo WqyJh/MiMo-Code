@@ -11,6 +11,7 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { InstanceState } from "@/effect"
 import { ActorRegistry } from "@/actor/registry"
 import { deriveLiveness } from "@/actor/schema"
+import { joinGroup } from "@/actor/group"
 import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
 import { forwardRef } from "@/permission/permission-forward-ref"
 import { Provider } from "@/provider"
@@ -23,7 +24,7 @@ import { TuiEvent } from "@/cli/cmd/tui/event"
 import type { SessionID, MessageID } from "../session/schema"
 import type { ProviderID, ModelID } from "../provider/schema"
 
-const KNOWN_VERBS = ["create", "send", "switch", "list", "status", "cancel", "ask", "setmode", "approve", "grant-approval"]
+const KNOWN_VERBS = ["create", "send", "switch", "list", "status", "cancel", "ask", "join", "setmode", "approve", "grant-approval"]
 
 // Wraps the human/agent question in a side-boundary system-reminder:
 // one-shot, READ-ONLY, answer-to-caller.
@@ -229,6 +230,22 @@ const askOperation = z.strictObject({
   question: z.string().min(1).describe("The side question to answer from a frozen snapshot of that session's history."),
 })
 
+const joinOperation = z.strictObject({
+  action: z.literal("join"),
+  sessionIDs: z
+    .array(z.string().min(1))
+    .min(1)
+    .describe(
+      "Child session ids forming the dispatch group. Blocks until ALL have reached a terminal state (success/fail/cancel), then returns one aggregated per-child summary.",
+    ),
+  timeout_ms: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Milliseconds to wait before returning a partial (timeout) aggregate. Default 600000 (10 min)."),
+})
+
 const setmodeOperation = z.strictObject({
   action: z.literal("setmode"),
   sessionID: z.string().min(1).describe("Session id of the child session whose mode to change."),
@@ -257,7 +274,7 @@ const parameters = z.strictObject({
   // {"operation":"{\"action\":\"create\",...}"} which fails zod validation.
   // See research-tool-call-schema/REPORT.md §2.5 "success-nested" warning.
   operation: z
-    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, statusOperation, cancelOperation, askOperation, setmodeOperation, approveOperation, grantApprovalOperation])
+    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, statusOperation, cancelOperation, askOperation, joinOperation, setmodeOperation, approveOperation, grantApprovalOperation])
     .meta({ type: "object" }),
 })
 
@@ -268,7 +285,7 @@ type Metadata = {
   sessionID?: string
 }
 
-type Deps = Session.Service | ActorRegistry.Service | Provider.Service | Worktree.Service
+type Deps = Session.Service | ActorRegistry.Service | Provider.Service | Worktree.Service | Bus.Service
 
 function parseSessionScript(script: string): Effect.Effect<SessionOperation[], unknown> {
   return Effect.gen(function* () {
@@ -430,6 +447,25 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
         operation: { action: "ask" as const, session_id: rest[0], question: rest.slice(1).join(" ") },
       })
     }
+    case "join": {
+      const { flags, rest, error } = extractSessionFlags(args, ["timeout"])
+      if (error) return flagError("join", error, line)
+      if (rest.length < 1) return arityError("join", "<sessionID...> [--timeout <ms>]", rest, line)
+      let timeout_ms: number | undefined
+      if (flags.timeout !== undefined) {
+        const n = Number(flags.timeout)
+        if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n))
+          return flagError("join", `--timeout must be a positive integer (got '${flags.timeout}')`, line)
+        timeout_ms = n
+      }
+      return Effect.succeed({
+        operation: {
+          action: "join" as const,
+          sessionIDs: rest,
+          ...(timeout_ms !== undefined ? { timeout_ms } : {}),
+        },
+      })
+    }
     case "setmode": {
       const { rest, error } = extractSessionFlags(args, [])
       if (error) return flagError("setmode", error, line)
@@ -470,6 +506,7 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
     const actorReg = yield* ActorRegistry.Service
     const provider = yield* Provider.Service
     const worktreeSvc = yield* Worktree.Service
+    const bus = yield* Bus.Service
 
     // Resolve the Actor service through the late-bound spawnRef rather than as a
     // Layer dependency: pulling Actor.Service into Deps would create a layer
@@ -828,6 +865,52 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
           title: `Asked ${op.session_id}`,
           output: answer,
           metadata: { sessionID: op.session_id } as Metadata,
+        }
+      }
+
+      if (op.action === "join") {
+        // Fan-in barrier: block until EVERY named child reaches a terminal state
+        // (success/fail/cancel — all three notify via T41 and write lastOutcome),
+        // then return one aggregated per-child summary. Peers register with
+        // session_id === actor_id === their own child id (see the create branch /
+        // Actor.spawnPeer), so both keys are the child session id. joinGroup does
+        // not busy-wait — it subscribes to ActorStatusChanged and re-snapshots the
+        // group as children settle. A bad/unknown id counts as "unknown" and never
+        // blocks the barrier.
+        const members = op.sessionIDs.map((sid) => ({
+          sessionID: sid as SessionID,
+          actorID: sid,
+        }))
+        const agg = yield* joinGroup(
+          { reg: actorReg, sessions, bus },
+          { members, ...(op.timeout_ms !== undefined ? { timeout_ms: op.timeout_ms } : {}) },
+        )
+        const lines = agg.members.map((m) => {
+          const who = m.description ? `${m.actorID} (${m.description})` : m.actorID
+          const detail =
+            m.outcome === "success"
+              ? m.reportedSummary ?? (m.result ? m.result.slice(0, 200) : "done")
+              : m.outcome === "failure"
+                ? m.error ?? "failed"
+                : m.outcome === "cancelled"
+                  ? "cancelled"
+                  : "unknown (no registered actor)"
+          return `  ${who} — ${m.outcome}: ${detail}`
+        })
+        const header =
+          agg.status === "timeout"
+            ? `Join TIMED OUT — ${agg.counts.success + agg.counts.failure + agg.counts.cancelled}/${agg.total} children terminal`
+            : `Join complete — all ${agg.total} children terminal`
+        const tally =
+          `${agg.counts.success} success, ${agg.counts.failure} failed, ${agg.counts.cancelled} cancelled` +
+          (agg.counts.unknown > 0 ? `, ${agg.counts.unknown} unknown` : "")
+        return {
+          title:
+            agg.status === "timeout"
+              ? `Join timed out (${agg.total} children)`
+              : `Joined ${agg.total} children`,
+          output: [`${header} (${tally}).`, "", ...lines].join("\n"),
+          metadata: {} as Metadata,
         }
       }
 

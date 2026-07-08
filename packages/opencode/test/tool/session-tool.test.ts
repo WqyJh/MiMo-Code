@@ -18,8 +18,8 @@ import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider"
 import { Session } from "../../src/session"
 import { Worktree } from "../../src/worktree"
-import { MessageID, SessionID } from "../../src/session/schema"
-import { ModelID } from "../../src/provider/schema"
+import { MessageID, SessionID, PartID } from "../../src/session/schema"
+import { ModelID, ProviderID } from "../../src/provider/schema"
 import { TaskRegistry } from "../../src/task/registry"
 import { Truncate } from "../../src/tool"
 import { SessionTool } from "../../src/tool/session"
@@ -954,7 +954,6 @@ import { forwardRef } from "../../src/permission/permission-forward-ref"
 import { Plugin } from "../../src/plugin"
 import { Provider as ProviderSvc } from "../../src/provider"
 import { Env } from "../../src/env"
-import { ProviderID } from "../../src/provider/schema"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { LLM } from "../../src/session/llm"
@@ -1343,5 +1342,232 @@ describe("session tool ask (fork-query) functional", () => {
       { git: true, config: askProviderCfg },
     ),
     60000,
+  )
+})
+
+// === T38: fan-in aggregation (session join) ===
+// Drive a GROUP of mock child peers to terminal states (mixing success / fail /
+// cancel) and assert `session join` resolves ONCE with an aggregated per-child
+// summary — and crucially does NOT resolve early while a member is still live.
+// Mock children = real sessions parented to the orchestrator + a registered peer
+// actor keyed by the child session id (the peer session_id === actor_id
+// convention). Terminal transitions go through registry.updateStatus, which
+// publishes ActorStatusChanged on the same instance Bus joinGroup subscribes to.
+const seedAssistantText = (sessionID: SessionID, actorID: string, text: string) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const userMsg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user" as const,
+      sessionID,
+      agentID: actorID,
+      time: { created: Date.now() },
+      agent: "build",
+      model: { providerID: ProviderID.make("test"), modelID: ModelID.make("test-model") },
+    })
+    const msgID = MessageID.ascending()
+    yield* sessions.updateMessage({
+      id: msgID,
+      role: "assistant" as const,
+      sessionID,
+      agentID: actorID,
+      mode: "default",
+      agent: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelID.make("test-model"),
+      providerID: ProviderID.make("test"),
+      parentID: userMsg.id,
+      time: { created: Date.now() },
+      finish: "end_turn",
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msgID,
+      sessionID,
+      type: "text" as const,
+      text,
+    })
+  })
+
+describe("session tool join (fan-in aggregation, T38)", () => {
+  // Register a mock child peer under `parent`, returning its child session id.
+  const mockChild = (parentID: SessionID, label: string) =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const registry = yield* ActorRegistry.Service
+      const child = yield* sessions.create({ parentID, title: label })
+      yield* registry.register({
+        sessionID: child.id,
+        actorID: child.id,
+        mode: "peer",
+        parentActorID: "main",
+        agent: "build",
+        description: label,
+        contextMode: "none",
+        contextWatermark: undefined,
+        background: true,
+        lifecycle: "persistent",
+      })
+      yield* registry.updateStatus(child.id, child.id, { status: "running" })
+      return child.id
+    })
+
+  it.live("parameters schema accepts a join operation with multiple session ids", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const parsed = tool.parameters.safeParse({
+          operation: { action: "join", sessionIDs: ["ses_a", "ses_b"] },
+        })
+        expect(parsed.success).toBe(true)
+      }),
+    ),
+  )
+
+  it.live("parameters schema rejects join with an empty sessionIDs array", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const parsed = tool.parameters.safeParse({
+          operation: { action: "join", sessionIDs: [] },
+        })
+        expect(parsed.success).toBe(false)
+      }),
+    ),
+  )
+
+  it.live(
+    "join resolves ONCE when all 3 children reach terminal (mix success/fail/cancel) and not early",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const registry = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "orchestrator" })
+        const tool = yield* (yield* SessionTool).init()
+
+        const a = yield* mockChild(parent.id, "child-A")
+        const b = yield* mockChild(parent.id, "child-B")
+        const c = yield* mockChild(parent.id, "child-C")
+
+        // Seed a result body for the one that will succeed.
+        yield* seedAssistantText(a, a, "A finished the job")
+
+        // Driver: flip children terminal one at a time with gaps. The join must
+        // NOT resolve until the LAST one (c) settles at ~90ms.
+        const settledOrder: string[] = []
+        yield* Effect.forkDetach(
+          Effect.gen(function* () {
+            yield* Effect.sleep("30 millis")
+            settledOrder.push("a")
+            yield* registry.updateStatus(a, a, { status: "idle", lastOutcome: "success" })
+            yield* Effect.sleep("30 millis")
+            settledOrder.push("b")
+            yield* registry.updateStatus(b, b, { status: "idle", lastOutcome: "failure", lastError: "B blew up" })
+            yield* Effect.sleep("30 millis")
+            settledOrder.push("c")
+            yield* registry.updateStatus(c, c, { status: "idle", lastOutcome: "cancelled" })
+          }),
+        )
+
+        const before = Date.now()
+        const result = yield* tool.execute(
+          { operation: { action: "join", sessionIDs: [a, b, c], timeout_ms: 5000 } },
+          ctx(parent.id),
+        )
+        const elapsed = Date.now() - before
+
+        // Did not resolve early: all three driver steps ran before join returned.
+        expect(settledOrder).toEqual(["a", "b", "c"])
+        // And it actually waited for the last transition (~90ms), not the fast path.
+        expect(elapsed).toBeGreaterThanOrEqual(80)
+
+        expect(result.title).toContain("Joined 3 children")
+        expect(result.output).toContain("all 3 children terminal")
+        expect(result.output).toContain("1 success, 1 failed, 1 cancelled")
+        // Per-child buckets present.
+        expect(result.output).toContain(`${a} (child-A) — success`)
+        expect(result.output).toContain(`${b} (child-B) — failure: B blew up`)
+        expect(result.output).toContain(`${c} (child-C) — cancelled`)
+      }),
+    ),
+    30000,
+  )
+
+  it.live(
+    "join returns immediately (fast path) when every child is already terminal",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const registry = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "orchestrator" })
+        const tool = yield* (yield* SessionTool).init()
+
+        const a = yield* mockChild(parent.id, "done-A")
+        const b = yield* mockChild(parent.id, "done-B")
+        yield* registry.updateStatus(a, a, { status: "idle", lastOutcome: "success" })
+        yield* registry.updateStatus(b, b, { status: "idle", lastOutcome: "success" })
+
+        const result = yield* tool.execute(
+          { operation: { action: "join", sessionIDs: [a, b], timeout_ms: 500 } },
+          ctx(parent.id),
+        )
+        expect(result.title).toContain("Joined 2 children")
+        expect(result.output).toContain("2 success")
+      }),
+    ),
+    30000,
+  )
+
+  it.live(
+    "join TIMES OUT (does not hang) while a child stays live, reporting a partial aggregate",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const registry = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "orchestrator" })
+        const tool = yield* (yield* SessionTool).init()
+
+        const a = yield* mockChild(parent.id, "fin-A")
+        const b = yield* mockChild(parent.id, "stuck-B")
+        // Only A settles; B stays running → the barrier must NOT resolve, it times out.
+        yield* registry.updateStatus(a, a, { status: "idle", lastOutcome: "success" })
+
+        const result = yield* tool.execute(
+          { operation: { action: "join", sessionIDs: [a, b], timeout_ms: 250 } },
+          ctx(parent.id),
+        )
+        expect(result.title).toContain("timed out")
+        expect(result.output).toContain("Join TIMED OUT")
+        expect(result.output).toContain("1/2 children terminal")
+      }),
+    ),
+    30000,
+  )
+
+  it.live(
+    "join treats an unknown session id as 'unknown' and does not block on it",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const registry = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "orchestrator" })
+        const tool = yield* (yield* SessionTool).init()
+
+        const a = yield* mockChild(parent.id, "real-A")
+        yield* registry.updateStatus(a, a, { status: "idle", lastOutcome: "success" })
+
+        const result = yield* tool.execute(
+          { operation: { action: "join", sessionIDs: [a, "ses_ghost"], timeout_ms: 500 } },
+          ctx(parent.id),
+        )
+        expect(result.title).toContain("Joined 2 children")
+        expect(result.output).toContain("all 2 children terminal")
+        expect(result.output).toContain("1 unknown")
+        expect(result.output).toContain("ses_ghost — unknown")
+      }),
+    ),
+    30000,
   )
 })
