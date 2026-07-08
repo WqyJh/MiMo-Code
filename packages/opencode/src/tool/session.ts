@@ -154,6 +154,26 @@ function suggestVerb(input: string): string | undefined {
 
 const id = "session"
 
+// --topic persistence: the topic label is stored as a machine-readable marker
+// prefixed onto the child session's TITLE (`[topic:<label>] <title>`). The
+// Session row already persists across restarts and is returned by
+// sessions.children, so this needs no schema/migration — a deliberately thin
+// surface. topicOf() reads a peer child's topic back for the reuse lookup;
+// tagTitle() writes the marker at create time.
+const TOPIC_MARKER = /^\[topic:([^\]]+)\]\s?/
+
+function topicOf(title: string): string | undefined {
+  const m = title.match(TOPIC_MARKER)
+  return m ? m[1] : undefined
+}
+
+function tagTitle(topic: string, title: string): string {
+  // Idempotent: never double-tag if the base title already carries a marker.
+  const base = title.replace(TOPIC_MARKER, "")
+  return `[topic:${topic}] ${base}`
+}
+
+
 const createOperation = z.strictObject({
   action: z.literal("create"),
   task: z.string().min(1).describe("The task/prompt for the child session's first turn."),
@@ -167,6 +187,13 @@ const createOperation = z.strictObject({
   title: z.string().min(1).optional().describe("Title for the child session. Defaults to the task prefix."),
   dir: z.string().min(1).optional().describe("Working directory the child runs in (any project or path). Defaults to the orchestrator's directory."),
   isolate: z.boolean().optional().describe("Run the child in its own git worktree of `dir` (concurrent-edit isolation). Non-git dir falls back to shared."),
+  topic: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Reuse a standing per-theme child: if a peer child already carries this topic, RELAY the task into it (enqueue+wake) instead of spawning; otherwise create a new child tagged with this topic. Avoids over-spawning sessions for the same theme.",
+    ),
 })
 
 const sendOperation = z.strictObject({
@@ -277,6 +304,7 @@ export function recoverSessionArgs(rawArgs: unknown): SessionOperation | undefin
     if (obj.mode === "build" || obj.mode === "plan" || obj.mode === "compose") op.mode = obj.mode
     if (typeof obj.model === "string") op.model = obj.model
     if (typeof obj.title === "string") op.title = obj.title
+    if (typeof obj.topic === "string") op.topic = obj.topic
     return { operation: op } as SessionOperation
   }
   return undefined
@@ -336,10 +364,10 @@ function arityError(verb: string, expected: string, args: string[], line: number
 function mapVerb(verb: string | undefined, args: string[], line: number): Effect.Effect<SessionOperation, unknown> {
   switch (verb) {
     case "create": {
-      const { flags, bools, rest, error } = extractSessionFlags(args, ["mode", "model", "title", "dir"], ["isolate"])
+      const { flags, bools, rest, error } = extractSessionFlags(args, ["mode", "model", "title", "dir", "topic"], ["isolate"])
       if (error) return flagError("create", error, line)
       if (rest.length < 1)
-        return arityError("create", "<task...> [--mode build|plan|compose] [--model <ref>] [--title <t>] [--dir <path>] [--isolate]", rest, line)
+        return arityError("create", "<task...> [--mode build|plan|compose] [--model <ref>] [--title <t>] [--dir <path>] [--topic <label>] [--isolate]", rest, line)
       if (flags.mode && flags.mode !== "build" && flags.mode !== "plan" && flags.mode !== "compose")
         return flagError("create", `--mode must be build, plan or compose (got '${flags.mode}')`, line)
       return Effect.succeed({
@@ -350,6 +378,7 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
           ...(flags.model ? { model: flags.model } : {}),
           ...(flags.title ? { title: flags.title } : {}),
           ...(flags.dir ? { dir: flags.dir } : {}),
+          ...(flags.topic ? { topic: flags.topic } : {}),
           ...(bools.isolate ? { isolate: true } : {}),
         },
       })
@@ -451,6 +480,55 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
 
       if (op.action === "create") {
         const actor = yield* requireActor()
+
+        // --topic find-or-reuse: before spawning, look for a standing peer child
+        // already tagged with this topic. If found, RELAY the task into it
+        // (enqueue+wake — the same idle-peer path `session send` uses) instead of
+        // over-spawning a fresh child. Filter identical to the `list` branch:
+        // real peers only (exclude subagents + system-spawned agents).
+        if (op.topic) {
+          const children = yield* sessions.children(ctx.sessionID as SessionID)
+          const enriched = yield* Effect.forEach(children, (child) =>
+            actorReg.get(child.id, child.id).pipe(Effect.map((a) => ({ child, actor: a }))),
+          )
+          const match = enriched.find(
+            ({ child, actor: a }) =>
+              a?.mode !== "subagent" &&
+              !(a && SYSTEM_SPAWNED_AGENT_TYPES.has(a.agent)) &&
+              topicOf(child.title) === op.topic,
+          )
+          if (match) {
+            const childID = match.child.id
+            const inboxSvc = inboxServiceRef.current
+            if (!inboxSvc) {
+              return yield* Effect.fail(
+                new Error("Inbox service unavailable — Inbox.defaultLayer must be running for the session tool to relay tasks"),
+              )
+            }
+            const sendResult = yield* inboxSvc
+              .send({
+                receiverSessionID: childID,
+                receiverActorID: childID,
+                senderSessionID: ctx.sessionID as SessionID,
+                senderActorID: ctx.actorID ?? "main",
+                content: op.task,
+              })
+              .pipe(Effect.catchTag("InboxReceiverNotFound", () => Effect.succeed({ inboxID: null as string | null })))
+            if (sendResult.inboxID !== null) {
+              return {
+                title: `Reused topic '${op.topic}' → relayed to ${childID}`,
+                output:
+                  `Found standing child ${childID} for topic '${op.topic}'. ` +
+                  `Enqueued the task into it and woke it — it runs the relayed task as its next turn.`,
+                metadata: { sessionID: childID } as Metadata,
+              }
+            }
+            // The tagged peer exists but isn't reachable yet (no receiver row).
+            // Fall through to create a fresh tagged child rather than fail — the
+            // topic still gets a standing child, just a new one.
+          }
+        }
+
         const model = op.model
           ? yield* provider
               .resolveModelRef(op.model, undefined)
@@ -509,12 +587,20 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
         })
         // spawnPeer titles the child session `${agentType}: ${task}`; honor an
         // explicit --title by overwriting it so `session list` shows what the
-        // orchestrator asked for.
-        if (op.title) yield* sessions.setTitle({ sessionID: result.sessionID, title: op.title })
+        // orchestrator asked for. When --topic is set, prefix the title with a
+        // `[topic:X]` marker so a later `create --topic X` finds and reuses this
+        // standing child (topicOf reads it back from sessions.children).
+        if (op.topic) {
+          const base = op.title ?? `${op.mode ?? "build"}: ${op.task.slice(0, 40)}`
+          yield* sessions.setTitle({ sessionID: result.sessionID, title: tagTitle(op.topic, base) })
+        } else if (op.title) {
+          yield* sessions.setTitle({ sessionID: result.sessionID, title: op.title })
+        }
         return {
           title: `Session created: ${result.sessionID}`,
           output:
             `Created child session ${result.sessionID} (mode: ${op.mode ?? "build"}) in ${effectiveDir}.` +
+            (op.topic ? ` Tagged with topic '${op.topic}' for reuse.` : ``) +
             (op.isolate && !isolateNotice ? ` Isolated in its own worktree.` : isolateNotice) +
             ` Running in the background.`,
           metadata: { sessionID: result.sessionID } as Metadata,

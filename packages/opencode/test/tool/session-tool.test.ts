@@ -708,8 +708,19 @@ describe("session tool dual-schema (shell + JSON) end-to-end", () => {
     ),
   )
 
-  it.live("shell form: create parses --mode plan", () =>
+  it.live("shell form: create parses --topic into the operation", () =>
     provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const ops = yield* tool.shell!.parse("session create fix the login flow --topic auth")
+        expect(ops[0]).toEqual({
+          operation: { action: "create", task: "fix the login flow", topic: "auth" },
+        })
+      }),
+    ),
+  )
+
+  it.live("shell form: create parses --mode plan", () =>    provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const tool = yield* (yield* SessionTool).init()
         const ops = yield* tool.shell!.parse("session create do it --mode plan")
@@ -785,6 +796,12 @@ describe("recoverSessionArgs", () => {
   test("carries mode/model/title on a bare create", () => {
     expect(recoverSessionArgs({ task: "x", mode: "compose", model: "standard", title: "T" })).toEqual({
       operation: { action: "create", task: "x", mode: "compose", model: "standard", title: "T" },
+    })
+  })
+
+  test("carries topic on a bare create", () => {
+    expect(recoverSessionArgs({ task: "x", topic: "auth" })).toEqual({
+      operation: { action: "create", task: "x", topic: "auth" },
     })
   })
 
@@ -1145,6 +1162,82 @@ describe("session tool ask (fork-query) functional", () => {
         yield* tool
           .execute({ operation: { action: "cancel", sessionID: childID } }, ctx(parent.id))
           .pipe(Effect.ignore)
+      }),
+      { git: true, config: askProviderCfg },
+    ),
+    60000,
+  )
+
+  // T43: `session create --topic X` find-or-reuse. First call with a topic
+  // spawns a standing child tagged with that topic; a SECOND call with the SAME
+  // topic must NOT spawn a new child — it relays the task into the first via the
+  // inbox enqueue+wake path (works on the idle/never-run peer thanks to T42's
+  // spawn-time receiver row). A DIFFERENT topic yields a DISTINCT child. Uses the
+  // full Inbox+Actor stack so the reuse relay hits the real Inbox.send.
+  askIt.live("session create --topic reuses one standing child for the same topic, distinct for a different one", () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({
+          title: "T43 topic parent",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        // Hang so created children never finish their first turn — they remain
+        // standing idle peers, exactly the reuse target.
+        yield* llm.hang
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+
+        const peerCount = () =>
+          Effect.gen(function* () {
+            const kids = yield* sessions.children(parent.id)
+            const enriched = yield* Effect.forEach(kids, (child) =>
+              actorReg.get(child.id, child.id).pipe(Effect.map((a) => ({ child, actor: a }))),
+            )
+            return enriched.filter(({ actor }) => actor?.mode === "peer")
+          })
+
+        // 1st create with topic "auth" → a new tagged child.
+        const first = yield* tool.execute(
+          { operation: { action: "create", task: "fix the login flow", mode: "build", topic: "auth" } },
+          ctx(parent.id),
+        )
+        const firstID = first.metadata.sessionID!
+        expect(firstID).toBeDefined()
+        expect(first.output).toContain("Tagged with topic 'auth'")
+        // Its title carries the machine marker so reuse can find it.
+        const firstSession = yield* sessions.get(SessionID.make(firstID))
+        expect(firstSession.title).toContain("[topic:auth]")
+        expect((yield* peerCount()).length).toBe(1)
+
+        // 2nd create with the SAME topic → NO new child; relays into the first.
+        const second = yield* tool.execute(
+          { operation: { action: "create", task: "also handle logout", mode: "build", topic: "auth" } },
+          ctx(parent.id),
+        )
+        expect(second.metadata.sessionID).toBe(firstID)
+        expect(second.title).toContain("Reused topic 'auth'")
+        expect(second.output).toContain("Enqueued the task")
+        // Still exactly ONE peer child for topic "auth".
+        expect((yield* peerCount()).length).toBe(1)
+
+        // A DIFFERENT topic → a DISTINCT new child.
+        const third = yield* tool.execute(
+          { operation: { action: "create", task: "add caching layer", mode: "build", topic: "perf" } },
+          ctx(parent.id),
+        )
+        const thirdID = third.metadata.sessionID!
+        expect(thirdID).toBeDefined()
+        expect(thirdID).not.toBe(firstID)
+        expect(third.output).toContain("Tagged with topic 'perf'")
+        // Now two distinct standing peers (auth + perf).
+        expect((yield* peerCount()).length).toBe(2)
+
+        for (const cid of [firstID, thirdID])
+          yield* tool.execute({ operation: { action: "cancel", sessionID: cid } }, ctx(parent.id)).pipe(Effect.ignore)
       }),
       { git: true, config: askProviderCfg },
     ),
