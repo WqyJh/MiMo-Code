@@ -639,6 +639,17 @@ export const layer = Layer.effect(
         title: `${input.agentType}: ${input.task.slice(0, 40)}`,
         ...(input.cwd ? { directory: input.cwd } : {}),
       })
+      // T42: register the peer's receiver/actor-registry row (session_id ===
+      // actor_id === child.id, mode "peer") SYNCHRONOUSLY here — before spawn
+      // resolves and before the child's first turn. This is the single
+      // spawn-time registration that makes a child addressable the instant
+      // `session create` returns: Inbox.send's ESRCH pre-check (reg.get) and
+      // `session send` both resolve against this row without waiting for the
+      // child to arm anything on its first turn. turn_count/status start at 0/
+      // "pending"; the per-step turn heartbeat (registry.updateTurn) advances
+      // them later. No double-registration: nothing on the first-turn path
+      // (prompt.ts) re-registers a peer — it only reads (reg.get) and updates
+      // (updateTurn/updateStatus). Prerequisite for T43 (--topic reuse).
       yield* actorReg.register({
         sessionID: child.id,
         actorID: child.id,

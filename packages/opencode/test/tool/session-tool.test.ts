@@ -1098,4 +1098,56 @@ describe("session tool ask (fork-query) functional", () => {
     ),
     60000,
   )
+
+  // T42: `session send` to a child that was JUST created (its first turn is
+  // still hanging, turnCount 0) must NOT return "not reachable"/ESRCH — the peer
+  // receiver row is registered at spawn time, so the relay enqueues immediately.
+  // This is the prerequisite for T43 (--topic reuse). Uses the full Inbox+Actor
+  // stack so the relay hits the real Inbox.send ESRCH pre-check.
+  askIt.live("session send to a just-created (never-run) child enqueues without ESRCH", () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({
+          title: "T42 relay parent",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        // Hang so the created child's first turn never completes: the receiver
+        // row can only come from spawn-time registration, not first-turn arming.
+        yield* llm.hang
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+
+        const created = yield* tool.execute(
+          { operation: { action: "create", task: "long running child", mode: "build", title: "Child" } },
+          ctx(parent.id),
+        )
+        const childID = created.metadata.sessionID!
+        expect(childID).toBeDefined()
+
+        // The peer receiver row exists at spawn: turnCount 0, still pending.
+        const row = yield* actorReg.get(SessionID.make(childID), childID)
+        expect(row?.mode).toBe("peer")
+        expect(row?.turnCount).toBe(0)
+
+        // Relay a task the instant after create — must succeed, not ESRCH.
+        const sent = yield* tool.execute(
+          { operation: { action: "send", sessionID: childID, task: "do this next" } },
+          ctx(parent.id),
+        )
+        expect(sent.title).toContain(`Relayed task to ${childID}`)
+        expect(sent.output).not.toContain("not reachable")
+        expect(sent.output).toContain("Enqueued the task")
+
+        yield* tool
+          .execute({ operation: { action: "cancel", sessionID: childID } }, ctx(parent.id))
+          .pipe(Effect.ignore)
+      }),
+      { git: true, config: askProviderCfg },
+    ),
+    60000,
+  )
 })
