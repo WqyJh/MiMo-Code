@@ -9,6 +9,8 @@ setDefaultTimeout(30_000)
 import { Agent } from "../../src/agent/agent"
 import { Actor } from "../../src/actor/spawn"
 import { ActorRegistry } from "../../src/actor/registry"
+import { ActorRegistryTable } from "../../src/actor/actor.sql"
+import { Database, and, eq } from "../../src/storage"
 import { Bus } from "../../src/bus"
 import { TuiEvent } from "../../src/cli/cmd/tui/event"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -404,10 +406,11 @@ describe("session tool", () => {
 
         // Total counts only the two real peers; subagent excluded.
         expect(result.title).toBe("Child sessions: 2")
-        expect(result.output).toContain("Child sessions: 2 total — 1 running, 1 idle")
+        expect(result.output).toContain("Child sessions: 2 total — 1 running (1 progressing, 0 stalled), 1 idle")
 
-        // Grouped section headings with per-group counts.
-        expect(result.output).toContain("In progress (running/pending) (1):")
+        // Grouped section headings with per-group counts. A freshly-created peer
+        // has lastTurnTime == now, so it reads as progressing.
+        expect(result.output).toContain("In progress — progressing (running/pending, advancing) (1):")
         expect(result.output).toContain("Finished / idle (1):")
 
         // Both real peers appear, under their respective groups.
@@ -598,6 +601,104 @@ describe("session tool", () => {
         if (result.output.includes("Removed its worktree")) expect(existsSync(childDir)).toBe(false)
       }),
       { git: true },
+    ),
+  )
+
+  it.live("status reports derived liveness + turnCount + lastTurnTime for a child", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+        const created = yield* tool.execute(
+          { operation: { action: "create", task: "work", mode: "build", title: "Runner" } },
+          ctx(parent.id),
+        )
+        const childID = created.metadata.sessionID!
+
+        // A freshly-created child has a recent lastTurnTime → progressing.
+        const running = yield* tool.execute({ operation: { action: "status", sessionID: childID } }, ctx(parent.id))
+        expect(running.title).toBe(`Status ${childID}: progressing`)
+        expect(running.output).toContain("progressing")
+        expect(running.output).toContain("turnCount:")
+        expect(running.output).toContain("lastTurnTime:")
+
+        // Flip to a terminal idle+success: derived liveness surfaces the outcome.
+        yield* actorReg.updateStatus(SessionID.make(childID), childID, { status: "idle", lastOutcome: "success" })
+        const done = yield* tool.execute({ operation: { action: "status", sessionID: childID } }, ctx(parent.id))
+        expect(done.title).toBe(`Status ${childID}: success`)
+        expect(done.output).toContain("last outcome: success")
+      }),
+    ),
+  )
+
+  it.live("status on an unknown child returns a clear not-found message (no throw)", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+        const tool = yield* (yield* SessionTool).init()
+        const result = yield* tool.execute(
+          { operation: { action: "status", sessionID: "ses_missing" } },
+          ctx(parent.id),
+        )
+        expect(result.title).toContain("not found")
+        expect(result.output).toContain("ses_missing")
+      }),
+    ),
+  )
+
+  it.live("list splits the In progress group into progressing vs stalled", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const actorReg = yield* ActorRegistry.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+
+        const info = yield* SessionTool
+        const tool = yield* info.init()
+
+        // A progressing peer: freshly created, lastTurnTime == now.
+        const prog = yield* tool.execute(
+          { operation: { action: "create", task: "advancing", mode: "build", title: "Fresh" } },
+          ctx(parent.id),
+        )
+        const progID = prog.metadata.sessionID!
+
+        // A stalled peer: running, but with an old last_turn_time far past the
+        // default staleness window → deriveLiveness reports stalled. Force status
+        // running, then age its last_turn_time via a direct row update (updateTurn
+        // would bump it to now; we need it OLD with turnCount unchanged).
+        const stalled = yield* tool.execute(
+          { operation: { action: "create", task: "wedged", mode: "build", title: "Wedged" } },
+          ctx(parent.id),
+        )
+        const stalledID = stalled.metadata.sessionID!
+        yield* actorReg.updateStatus(SessionID.make(stalledID), stalledID, { status: "running" })
+        yield* Effect.sync(() =>
+          Database.use((db) =>
+            db
+              .update(ActorRegistryTable)
+              .set({ last_turn_time: Date.now() - 10 * 60_000 })
+              .where(and(eq(ActorRegistryTable.session_id, SessionID.make(stalledID)), eq(ActorRegistryTable.actor_id, stalledID)))
+              .run(),
+          ),
+        )
+
+        const result = yield* tool.execute({ operation: { action: "list" } }, ctx(parent.id))
+
+        expect(result.output).toContain("In progress — progressing (running/pending, advancing) (1):")
+        expect(result.output).toContain("In progress — stalled (running/pending, no recent turn) (1):")
+        expect(result.output).toContain("(1 progressing, 1 stalled)")
+        // Each child lands under its own group.
+        const progSection = result.output.split("In progress — progressing")[1]?.split("In progress — stalled")[0] ?? ""
+        expect(progSection).toContain(progID)
+        const stalledSection = result.output.split("In progress — stalled")[1] ?? ""
+        expect(stalledSection).toContain(stalledID)
+      }),
     ),
   )
 })

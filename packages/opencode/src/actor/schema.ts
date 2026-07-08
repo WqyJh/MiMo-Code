@@ -45,3 +45,36 @@ export const Actor = z
   })
   .meta({ ref: "Actor" })
 export type Actor = z.infer<typeof Actor>
+
+// Derived liveness: a pull-side signal computed from an actor row's honest
+// registry fields (status, lastOutcome, lastTurnTime). It answers the question
+// raw `status` cannot — is a running child PROGRESSING or STALLED?
+//   - progressing: running/pending AND its last turn advanced within the
+//     staleness window (updateTurn bumps last_turn_time per step, so a recent
+//     last_turn_time == recent progress).
+//   - stalled: running/pending BUT no turn advance for longer than the window.
+//   - success | failure | cancelled: terminal, taken straight from lastOutcome.
+//   - idle: finished with no recorded outcome (or an unknown state).
+// Never fabricates: every value maps 1:1 to fields the engine actually wrote.
+export const Liveness = z.enum(["progressing", "stalled", "success", "failure", "cancelled", "idle"])
+export type Liveness = z.infer<typeof Liveness>
+
+// Default staleness threshold: a running child with no turn advance for this
+// long is reported `stalled`. 90s sits between the per-step turn cadence and
+// the 5-minute stuck-detection cutoff, so a briefly-thinking child still reads
+// as progressing while a genuinely wedged one flips to stalled well before the
+// watchdog (T40) would fire.
+export const DEFAULT_LIVENESS_STALL_MS = 90_000
+
+export function deriveLiveness(
+  actor: Pick<Actor, "status" | "lastOutcome" | "lastTurnTime">,
+  now: number = Date.now(),
+  stallMs: number = DEFAULT_LIVENESS_STALL_MS,
+): Liveness {
+  if (actor.status === "running" || actor.status === "pending")
+    return now - actor.lastTurnTime <= stallMs ? "progressing" : "stalled"
+  if (actor.lastOutcome === "success") return "success"
+  if (actor.lastOutcome === "failure") return "failure"
+  if (actor.lastOutcome === "cancelled") return "cancelled"
+  return "idle"
+}

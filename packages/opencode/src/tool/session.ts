@@ -10,6 +10,8 @@ import { Instance } from "@/project/instance"
 import { InstanceRef } from "@/effect/instance-ref"
 import { InstanceState } from "@/effect"
 import { ActorRegistry } from "@/actor/registry"
+import { deriveLiveness } from "@/actor/schema"
+import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
 import { forwardRef } from "@/permission/permission-forward-ref"
 import { Provider } from "@/provider"
 import { spawnRef } from "@/actor/spawn-ref"
@@ -21,7 +23,7 @@ import { TuiEvent } from "@/cli/cmd/tui/event"
 import type { SessionID, MessageID } from "../session/schema"
 import type { ProviderID, ModelID } from "../provider/schema"
 
-const KNOWN_VERBS = ["create", "send", "switch", "list", "cancel", "ask", "setmode", "approve", "grant-approval"]
+const KNOWN_VERBS = ["create", "send", "switch", "list", "status", "cancel", "ask", "setmode", "approve", "grant-approval"]
 
 // Wraps the human/agent question in a side-boundary system-reminder:
 // one-shot, READ-ONLY, answer-to-caller.
@@ -211,6 +213,11 @@ const listOperation = z.strictObject({
   action: z.literal("list"),
 })
 
+const statusOperation = z.strictObject({
+  action: z.literal("status"),
+  sessionID: z.string().min(1).describe("Child session id to report derived liveness for (progressing/stalled/terminal + turn telemetry)."),
+})
+
 const cancelOperation = z.strictObject({
   action: z.literal("cancel"),
   sessionID: z.string().min(1).describe("Session id of the child session to stop."),
@@ -250,7 +257,7 @@ const parameters = z.strictObject({
   // {"operation":"{\"action\":\"create\",...}"} which fails zod validation.
   // See research-tool-call-schema/REPORT.md §2.5 "success-nested" warning.
   operation: z
-    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, cancelOperation, askOperation, setmodeOperation, approveOperation, grantApprovalOperation])
+    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, statusOperation, cancelOperation, askOperation, setmodeOperation, approveOperation, grantApprovalOperation])
     .meta({ type: "object" }),
 })
 
@@ -402,6 +409,12 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
       if (error) return flagError("list", error, line)
       if (rest.length !== 0) return arityError("list", "", rest, line)
       return Effect.succeed({ operation: { action: "list" as const } })
+    }
+    case "status": {
+      const { rest, error } = extractSessionFlags(args, [])
+      if (error) return flagError("status", error, line)
+      if (rest.length !== 1) return arityError("status", "<sessionID>", rest, line)
+      return Effect.succeed({ operation: { action: "status" as const, sessionID: rest[0] } })
     }
     case "cancel": {
       const { rest, error } = extractSessionFlags(args, [])
@@ -692,26 +705,34 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
           actorReg.get(child.id, child.id).pipe(Effect.map((actor) => ({ child, actor }))),
         )
         // The actor row's status enum is only pending|running|idle; a terminal
-        // idle carries a lastOutcome (success/failure/cancelled). Derive a
-        // display bucket from (status, lastOutcome): running/pending are live,
-        // idle+cancelled/failure are terminal-with-outcome, everything else is
-        // a plain finished/idle child. Never fabricate a state the data lacks.
+        // idle carries a lastOutcome (success/failure/cancelled). deriveLiveness
+        // maps (status, lastOutcome, lastTurnTime) to a display bucket:
+        // running/pending split into progressing vs stalled by whether the last
+        // turn advanced within the staleness window (updateTurn bumps
+        // last_turn_time per step — recent == progressing); terminal idle rows
+        // map to success(→idle)/failure/cancelled. Never fabricate a state the
+        // data lacks: a missing actor row is a plain idle.
+        const now = Date.now()
         const bucketOf = ({ actor }: (typeof peers)[number]) => {
           if (!actor) return "idle" as const
-          if (actor.status === "running" || actor.status === "pending") return "running" as const
-          if (actor.lastOutcome === "cancelled") return "cancelled" as const
-          if (actor.lastOutcome === "failure") return "failed" as const
+          const live = deriveLiveness(actor, now)
+          if (live === "progressing") return "progressing" as const
+          if (live === "stalled") return "stalled" as const
+          if (live === "cancelled") return "cancelled" as const
+          if (live === "failure") return "failed" as const
           return "idle" as const
         }
         const tagged = peers.map((p) => ({ ...p, bucket: bucketOf(p) }))
         const counts = {
-          running: tagged.filter((p) => p.bucket === "running").length,
+          progressing: tagged.filter((p) => p.bucket === "progressing").length,
+          stalled: tagged.filter((p) => p.bucket === "stalled").length,
           idle: tagged.filter((p) => p.bucket === "idle").length,
           cancelled: tagged.filter((p) => p.bucket === "cancelled").length,
           failed: tagged.filter((p) => p.bucket === "failed").length,
         }
         const groups: { bucket: keyof typeof counts; heading: string }[] = [
-          { bucket: "running", heading: "In progress (running/pending)" },
+          { bucket: "progressing", heading: "In progress — progressing (running/pending, advancing)" },
+          { bucket: "stalled", heading: "In progress — stalled (running/pending, no recent turn)" },
           { bucket: "idle", heading: "Finished / idle" },
           { bucket: "failed", heading: "Failed" },
           { bucket: "cancelled", heading: "Cancelled" },
@@ -727,14 +748,43 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
               )
             return `${g.heading} (${counts[g.bucket]}):\n${lines.join("\n")}`
           })
+        const running = counts.progressing + counts.stalled
         const summary =
-          `Child sessions: ${peers.length} total — ${counts.running} running, ${counts.idle} idle` +
+          `Child sessions: ${peers.length} total — ${running} running (${counts.progressing} progressing, ${counts.stalled} stalled), ${counts.idle} idle` +
           (counts.failed > 0 ? `, ${counts.failed} failed` : "") +
           (counts.cancelled > 0 ? `, ${counts.cancelled} cancelled` : "")
         return {
           title: `Child sessions: ${peers.length}`,
           output: [summary, "", ...sections].join("\n"),
           metadata: {} as Metadata,
+        }
+      }
+
+      if (op.action === "status") {
+        // Derived pull-side liveness for one child. A peer registers with
+        // session_id === actor_id === its own child id (see the create branch /
+        // Actor.spawnPeer), so key the row by (childID, childID). deriveLiveness
+        // turns the honest registry fields (status/lastOutcome/lastTurnTime) into
+        // progressing|stalled|terminal — never fabricating a state the row lacks.
+        const childID = op.sessionID
+        const found = yield* actorReg.liveness(childID as SessionID, childID)
+        if (!found)
+          return {
+            title: `Status: ${childID} not found`,
+            output: `No actor registered for ${childID}. It may not exist or never started.`,
+            metadata: { sessionID: childID } as Metadata,
+          }
+        const ageMs = Date.now() - found.actor.lastTurnTime
+        const ageStr = ageMs < 60_000 ? `${Math.floor(ageMs / 1000)}s` : `${Math.floor(ageMs / 60_000)}m`
+        const outcome = found.actor.lastOutcome ? ` (last outcome: ${found.actor.lastOutcome})` : ""
+        return {
+          title: `Status ${childID}: ${found.liveness}`,
+          output:
+            `${childID} — ${found.liveness}${outcome}\n` +
+            `  raw status: ${found.actor.status}\n` +
+            `  turnCount: ${found.actor.turnCount}\n` +
+            `  lastTurnTime: ${found.actor.lastTurnTime} (${ageStr} ago)`,
+          metadata: { sessionID: childID } as Metadata,
         }
       }
 
