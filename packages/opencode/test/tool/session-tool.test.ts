@@ -126,6 +126,47 @@ describe("session tool", () => {
     ),
   )
 
+  it.live("parameters schema accepts a send operation", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const parsed = tool.parameters.safeParse({
+          operation: { action: "send", sessionID: "ses_child", task: "relay this" },
+        })
+        expect(parsed.success).toBe(true)
+      }),
+    ),
+  )
+
+  it.live("parameters schema rejects send with an empty task", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const parsed = tool.parameters.safeParse({
+          operation: { action: "send", sessionID: "ses_child", task: "" },
+        })
+        expect(parsed.success).toBe(false)
+      }),
+    ),
+  )
+
+  it.live("send to an unknown child returns a clear not-found message (no throw)", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+        const tool = yield* (yield* SessionTool).init()
+        const result = yield* tool.execute(
+          { operation: { action: "send", sessionID: "ses_missing", task: "hello" } },
+          ctx(parent.id),
+        )
+        expect(result.title).toContain("not found")
+        expect(result.output).toContain("ses_missing")
+        expect(result.metadata.sessionID).toBe("ses_missing")
+      }),
+    ),
+  )
+
   it.live("create spawns a child peer session registered with mode peer + agent build", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
@@ -637,6 +678,20 @@ describe("session tool dual-schema (shell + JSON) end-to-end", () => {
         expect(yield* parse("session cancel ses_xyz")).toEqual([
           { operation: { action: "cancel", sessionID: "ses_xyz" } },
         ])
+        // `send` takes a sessionID + a joined multi-word task.
+        expect(yield* parse("session send ses_child go fix the flaky test")).toEqual([
+          { operation: { action: "send", sessionID: "ses_child", task: "go fix the flaky test" } },
+        ])
+      }),
+    ),
+  )
+
+  it.live("shell form: send requires a sessionID AND a task (arity error otherwise)", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* SessionTool).init()
+        const exit = yield* Effect.exit(tool.shell!.parse("session send ses_only"))
+        expect(exit._tag).toBe("Failure")
       }),
     ),
   )

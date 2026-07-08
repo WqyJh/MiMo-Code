@@ -13,6 +13,7 @@ import { ActorRegistry } from "@/actor/registry"
 import { forwardRef } from "@/permission/permission-forward-ref"
 import { Provider } from "@/provider"
 import { spawnRef } from "@/actor/spawn-ref"
+import { inboxServiceRef } from "@/inbox/inbox-ref"
 import { prefixCaptureRef } from "@/session/prefix-capture-ref"
 import type { ForkContext, Interface as ActorInterface } from "@/actor/spawn"
 import { Bus } from "@/bus"
@@ -20,7 +21,7 @@ import { TuiEvent } from "@/cli/cmd/tui/event"
 import type { SessionID, MessageID } from "../session/schema"
 import type { ProviderID, ModelID } from "../provider/schema"
 
-const KNOWN_VERBS = ["create", "switch", "list", "cancel", "ask", "setmode", "approve", "grant-approval"]
+const KNOWN_VERBS = ["create", "send", "switch", "list", "cancel", "ask", "setmode", "approve", "grant-approval"]
 
 // Wraps the human/agent question in a side-boundary system-reminder:
 // one-shot, READ-ONLY, answer-to-caller.
@@ -168,6 +169,12 @@ const createOperation = z.strictObject({
   isolate: z.boolean().optional().describe("Run the child in its own git worktree of `dir` (concurrent-edit isolation). Non-git dir falls back to shared."),
 })
 
+const sendOperation = z.strictObject({
+  action: z.literal("send"),
+  sessionID: z.string().min(1).describe("Child session id to relay a new task to (enqueues into its inbox and wakes it)."),
+  task: z.string().min(1).describe("The task/message to relay. The idle-but-persistent child wakes and drains it as its next turn."),
+})
+
 const switchOperation = z.strictObject({
   action: z.literal("switch"),
   sessionID: z.string().min(1).describe("Session id to move the user's frontend panel to."),
@@ -216,7 +223,7 @@ const parameters = z.strictObject({
   // {"operation":"{\"action\":\"create\",...}"} which fails zod validation.
   // See research-tool-call-schema/REPORT.md §2.5 "success-nested" warning.
   operation: z
-    .discriminatedUnion("action", [createOperation, switchOperation, listOperation, cancelOperation, askOperation, setmodeOperation, approveOperation, grantApprovalOperation])
+    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, cancelOperation, askOperation, setmodeOperation, approveOperation, grantApprovalOperation])
     .meta({ type: "object" }),
 })
 
@@ -345,6 +352,14 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
           ...(flags.dir ? { dir: flags.dir } : {}),
           ...(bools.isolate ? { isolate: true } : {}),
         },
+      })
+    }
+    case "send": {
+      const { rest, error } = extractSessionFlags(args, [])
+      if (error) return flagError("send", error, line)
+      if (rest.length < 2) return arityError("send", "<sessionID> <task...>", rest, line)
+      return Effect.succeed({
+        operation: { action: "send" as const, sessionID: rest[0], task: rest.slice(1).join(" ") },
       })
     }
     case "switch": {
@@ -503,6 +518,68 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
             (op.isolate && !isolateNotice ? ` Isolated in its own worktree.` : isolateNotice) +
             ` Running in the background.`,
           metadata: { sessionID: result.sessionID } as Metadata,
+        }
+      }
+
+      if (op.action === "send") {
+        // Relay a NEW task into a standing (persistent) child, waking it if idle.
+        // A peer child registers with session_id === actor_id === its own child
+        // id (see the create branch / Actor.spawnPeer), so both the receiver
+        // session and actor id are the child session id. Inbox.send enqueues a
+        // durable row and fork-schedules a wake; the woken runLoop drains it as
+        // the child's next turn. Gap-A's drain seed-fallback ensures an idle /
+        // turnCount-0 peer still converts the queued task into a turn instead of
+        // idling back with the task stuck in the DB.
+        const childID = op.sessionID as SessionID
+        // Pre-check the child is actually a peer we manage; give a clear message
+        // instead of a raw ESRCH if the id is wrong or the child never existed.
+        const actor = yield* actorReg.get(childID, childID)
+        if (!actor) {
+          return {
+            title: `Send failed: ${op.sessionID} not found`,
+            output:
+              `No child session ${op.sessionID} is registered. Use \`session list\` to see your children, ` +
+              `or \`session create\` to start a new one.`,
+            metadata: { sessionID: op.sessionID } as Metadata,
+          }
+        }
+        const inboxSvc = inboxServiceRef.current
+        if (!inboxSvc) {
+          return yield* Effect.fail(
+            new Error("Inbox service unavailable — Inbox.defaultLayer must be running for the session tool to relay tasks"),
+          )
+        }
+        const sendResult = yield* inboxSvc
+          .send({
+            receiverSessionID: childID,
+            receiverActorID: childID,
+            senderSessionID: ctx.sessionID as SessionID,
+            senderActorID: ctx.actorID ?? "main",
+            content: op.task,
+          })
+          .pipe(
+            Effect.catchTag("InboxReceiverNotFound", () =>
+              Effect.succeed({ inboxID: null as string | null }),
+            ),
+          )
+        if (sendResult.inboxID === null) {
+          return {
+            title: `Send failed: ${op.sessionID} not reachable`,
+            output:
+              `Child ${op.sessionID} exists but has no inbox receiver row yet (it may not have started). ` +
+              `Retry once it is running, or \`session create\` a fresh child.`,
+            metadata: { sessionID: op.sessionID } as Metadata,
+          }
+        }
+        return {
+          title: `Relayed task to ${op.sessionID}`,
+          output:
+            `Enqueued the task into child ${op.sessionID} and woke it. ` +
+            `It will run the relayed task as its next turn` +
+            (actor.status === "running" || actor.status === "pending"
+              ? ` (currently busy — the task is queued and drains after its current turn).`
+              : `.`),
+          metadata: { sessionID: op.sessionID } as Metadata,
         }
       }
 
