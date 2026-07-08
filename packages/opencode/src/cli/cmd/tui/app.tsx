@@ -487,6 +487,16 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     // inside the async block, gated by the SAME `sdk.directory !== dir` check
     // that gates the actual switch (race-free: uses the freshly-resolved dir,
     // not the async-populated signal).
+    // A `-s <orchestratorSessionID>` launch from OUTSIDE orchestratorDir (the
+    // common case: user runs `mimo -s <id>` from a project dir) navigates the
+    // route to that session (app.tsx onMount) and auto-restores agent=orchestrator
+    // from the session's last message. That drives us here with sdk.directory !==
+    // dir, so we navigate home before the switch (T36, to avoid the blackscreen of
+    // a stale launch-dir session). But the user explicitly asked to RESUME that
+    // session — leaving them on the blank home composer is the regression. So we
+    // remember they came in via `-s` on a session route and re-enter the resolved
+    // orchestrator root AFTER the switch+bootstrap, showing its history.
+    const resumeIntoSession = args.sessionID != null && route.data.type === "session"
     void (async () => {
       try {
         const dir = await orchestratorDir()
@@ -501,6 +511,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
           .find((x) => x.parentID === undefined)?.id
         if (existing) {
           local.orchestrator.setSessionID(existing)
+          // Restore the resumed view: a `-s` launch wanted to land IN the
+          // orchestrator session, not on home. Safe after bootstrap — the root
+          // now exists in the (switched) orchestratorDir.
+          if (resumeIntoSession) route.navigate({ type: "session", sessionID: existing })
         } else {
           const res = await sdk.client.session.create({})
           if (res.data?.id) local.orchestrator.setSessionID(res.data.id)
