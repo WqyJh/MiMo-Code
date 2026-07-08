@@ -259,7 +259,7 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
-  readonly sweepOrphanAssistants: (sessionID: SessionID) => Effect.Effect<void>
+  readonly sweepOrphanAssistants: (sessionID: SessionID, immediate?: boolean) => Effect.Effect<void>
   readonly predict: (input: { sessionID: SessionID }) => Effect.Effect<string>
 }
 
@@ -1968,7 +1968,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
-    const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (sessionID: SessionID) {
+    const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (
+      sessionID: SessionID,
+      // When true, sweep dangling assistants regardless of age. The caller sets
+      // this when the session is idle (no active runner), meaning any assistant
+      // without time.completed is definitively orphaned — left behind by a hard
+      // interruption (process crash / kill / disconnect) that skipped the normal
+      // `finish` effect, not an in-flight retry chain. Sweeping immediately
+      // matters because the TUI derives its "pending" marker from the newest
+      // incomplete assistant (routes/session/index.tsx `pending`): a stale
+      // orphan otherwise makes EVERY newly submitted message on an idle session
+      // render as stuck QUEUED for up to ORPHAN_AGE_MS (an hour). Defaults to
+      // false so background callers (spawn/hook) keep the age guard.
+      immediate = false,
+    ) {
       const msgs = yield* sessions.messages({ sessionID, agentID: "*" })
       const now = Date.now()
       // 1 hour — must exceed Task 1's chunkMs (300s) plus Task 2's
@@ -1980,7 +1993,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (m.info.role !== "assistant") continue
         if (m.info.time?.completed) continue
         const created = m.info.time?.created ?? 0
-        if (now - created < ORPHAN_AGE_MS) continue
+        if (!immediate && now - created < ORPHAN_AGE_MS) continue
         m.info.time = { ...m.info.time, completed: now }
         m.info.error =
           m.info.error ??
@@ -2008,7 +2021,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const session = yield* sessions.get(input.sessionID)
         if (input.source !== "spawn" && input.source !== "hook") {
           yield* revert.cleanup(session)
-          yield* sweepOrphanAssistants(input.sessionID)
+          // An idle session has no active runner, so any dangling assistant is a
+          // true orphan from a hard interruption — sweep it now (age-independent)
+          // so a fresh message is not rendered as stuck QUEUED behind it.
+          const idle = (yield* status.get(input.sessionID)).type === "idle"
+          yield* sweepOrphanAssistants(input.sessionID, idle)
         }
         const message = yield* createUserMessage(input)
         yield* sessions.touch(input.sessionID)
