@@ -17,6 +17,7 @@ import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "../../src/session"
+import { MessageV2 } from "../../src/session/message-v2"
 import { LLM } from "../../src/session/llm"
 import { AppFileSystem } from "@mimo-ai/shared/filesystem"
 import { SessionPrune } from "../../src/session/prune"
@@ -464,22 +465,39 @@ describe("Actor.spawn inbox notifications (Plan 3 / Task 2)", () => {
           })
           .pipe(Effect.orDie)
 
-        // Poll the parent inbox until the woken-turn notification arrives.
-        const rows = yield* Effect.gen(function* () {
+        // Poll for the woken-turn notification. Delivery can land in TWO places:
+        // the raw InboxTable row, OR — because inbox.send also fork-wakes the
+        // parent main runner — a drained synthetic user message in the parent
+        // main slice (the woken parent consumes the row into a message). Checking
+        // only the raw row races the parent's drain and is flaky; assert on
+        // either surface. Either way the actor_notification WAS delivered.
+        const found = yield* Effect.gen(function* () {
           for (let i = 0; i < 200; i++) {
             const r = yield* inboxRows("main")
-            if (r.length > 0) return r
+            if (r.length > 0) {
+              const content = r[0].content as { text?: string }
+              return { type: r[0].type, text: content.text ?? "" }
+            }
+            const msgs = yield* Session.Service.use((s) => s.messages({ sessionID: parent.id, agentID: "main" })).pipe(
+              Effect.catch(() => Effect.succeed([] as MessageV2.WithParts[])),
+            )
+            for (const m of msgs) {
+              for (const p of m.parts) {
+                if (p.type === "text" && p.synthetic && p.text.includes("<actor-notification>")) {
+                  return { type: "actor_notification", text: p.text }
+                }
+              }
+            }
             yield* Effect.sleep("25 millis")
           }
-          return yield* inboxRows("main")
+          return undefined
         })
 
-        expect(rows.length).toBe(1)
-        expect(rows[0].type).toBe("actor_notification")
-        const content = rows[0].content as { text?: string }
-        expect(content.text).toContain("<actor-notification>")
-        expect(content.text).toContain("woken peer task")
-        expect(content.text).toContain("completed")
+        expect(found).toBeDefined()
+        expect(found!.type).toBe("actor_notification")
+        expect(found!.text).toContain("<actor-notification>")
+        expect(found!.text).toContain("woken peer task")
+        expect(found!.text).toContain("completed")
 
         yield* actor.cancel(result.sessionID, result.actorID, "forced").pipe(Effect.ignore)
       }),
