@@ -377,10 +377,39 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     })
   })
 
+  // Resolve the orchestrator workspace path once so the -c resume effect below
+  // can tell whether we were launched inside it (only relevant when the feature
+  // is enabled).
+  const [orchestratorDirPath, setOrchestratorDirPath] = createSignal<string | undefined>(undefined)
+  onMount(() => {
+    if (!Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR) return
+    void orchestratorDir()
+      .then(setOrchestratorDirPath)
+      .catch(() => {})
+  })
+
   let continued = false
   createEffect(() => {
     // When using -c, session list is loaded in blocking phase, so we can navigate at "partial"
     if (continued || sync.status === "loading" || !args.continue) return
+    // Resuming via -c inside the orchestrator workspace means the most-recent
+    // root session IS the persistent orchestrator session. Enter Orchestrator
+    // mode directly (mirrors -s landing in it) instead of resuming it as a
+    // plain build session: switching the agent lets the orchestrator-entry
+    // effect resolve+stash the root, and the composer submits into it. Without
+    // this, -c resumes the orchestrator session in build mode and a later Tab
+    // switch would blackscreen (route left on a session from the launch dir).
+    if (
+      Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR &&
+      orchestratorDirPath() !== undefined &&
+      sdk.directory === orchestratorDirPath()
+    ) {
+      continued = true
+      // No-op if --agent orchestrator already selected it; the entry effect
+      // resolves+stashes the root either way and the composer submits into it.
+      if (local.agent.current()?.name !== "orchestrator") local.agent.set("orchestrator")
+      return
+    }
     const match = sync.data.session
       .toSorted((a, b) => b.time.updated - a.time.updated)
       .find((x) => x.parentID === undefined && !isSystemSession(x))?.id
@@ -445,6 +474,14 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     }
     if (prev === "orchestrator" || enteringOrchestrator) return
     enteringOrchestrator = true
+    // If we're currently viewing a session (e.g. resumed via -c/-s into a
+    // build session), that session belongs to the LAUNCH directory and will
+    // not exist once we switch the SDK to orchestratorDir(). Leaving the route
+    // pointed at it makes the session route's session.get fail against the new
+    // directory and blank the view (blackscreen). Return to home FIRST so the
+    // view matches the healthy fresh-orchestrator-entry state: the composer is
+    // visible and submits the first message into the stashed root session.
+    if (route.data.type === "session") route.navigate({ type: "home" })
     void (async () => {
       try {
         const dir = await orchestratorDir()
