@@ -83,4 +83,28 @@ describe("orchestrator prompt", () => {
     expect(PROMPT_ORCHESTRATOR).toMatch(/notification/i)
     expect(PROMPT_ORCHESTRATOR).toMatch(/detached|commit hash|branch ref/i)
   })
+
+  test("aligns to shipped primitives: session send/status/join, --topic, event-driven stall (T44)", () => {
+    // T44: the prompt documents the primitives that actually landed on this
+    // branch — the reliable relay verb, derived liveness, fan-in, per-theme
+    // reuse, and event-driven stall notifications.
+    expect(PROMPT_ORCHESTRATOR).toContain("session send")
+    expect(PROMPT_ORCHESTRATOR).toContain("session status")
+    expect(PROMPT_ORCHESTRATOR).toContain("--topic")
+    expect(PROMPT_ORCHESTRATOR).toContain("join")
+    expect(PROMPT_ORCHESTRATOR).toMatch(/stalled/i)
+    // Stall detection is event-driven now: the orchestrator is NOTIFIED when a
+    // child stalls, rather than being told to poll for it.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/watchdog|actor_notification\{stalled\}|told when a child|wait event-driven/i)
+  })
+
+  test("drops the stale relay + KNOWN-LIMITATION guidance that shipped primitives obsoleted (T44)", () => {
+    // The idle-relay-is-unreliable caveat (fixed by T25/T42) and the
+    // resume-via-actor-send relay must be gone: relaying is now `session send`.
+    expect(PROMPT_ORCHESTRATOR).not.toContain("KNOWN LIMITATION")
+    expect(PROMPT_ORCHESTRATOR).not.toContain("receiver not found")
+    // The old resume text drove relay via the actor send action; resume is now
+    // `list` + `session send`.
+    expect(PROMPT_ORCHESTRATOR).not.toContain("`actor` send action")
+  })
 })
