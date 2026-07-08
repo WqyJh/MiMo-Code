@@ -10,9 +10,10 @@ import { TaskRegistry } from "@/task/registry"
 import { TaskGate, MAX_TASK_GATE_SUBAGENT_REACT } from "@/task/gate"
 import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
-import type { SpawnMode, ContextMode, ToolWhitelist, Lifecycle } from "@/actor/schema"
+import type { Actor, SpawnMode, ContextMode, ToolWhitelist, Lifecycle } from "@/actor/schema"
 import { runTurn } from "@/actor/turn"
 import { spawnRef } from "@/actor/spawn-ref"
+import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
 import { Bus } from "@/bus"
 import { TuiEvent } from "@/cli/cmd/tui/event"
 import { MessageV2 } from "@/session/message-v2"
@@ -209,6 +210,17 @@ export const layer = Layer.effect(
     // cleared on terminal status. Fiber tracking moved to SessionRunState.
     const forkContexts = new Map<string, ForkContext>()
 
+    // Actors whose cancel() has begun, keyed "sessionID:actorID". Populated
+    // BEFORE the fiber is interrupted so forkWork's onSuccess/onFailure notify
+    // can suppress its own (misleading) emit — a cancelled child's interrupt is
+    // masked by the runLoop onInterrupt handler (returns lastAssistant), so the
+    // work fiber sees a spurious "success". The authoritative "cancelled"
+    // notification is emitted instead by Actor.cancel via notifyTerminal, which
+    // runs in-context after updateStatus. This unifies success/failure/cancel
+    // onto one parent-notification contract without double-notifying. See T41.
+    const cancelling = new Set<string>()
+    const cancelKey = (sessionID: SessionID, actorID: string) => `${sessionID}:${actorID}`
+
     // Real agent loop: marks the actor running, then drives a SessionPrompt.prompt
     // turn. The user message persisted by SessionPrompt carries the actor's
     // agentID, which the projector writes to MessageTable.agent_id — that is the
@@ -297,7 +309,13 @@ export const layer = Layer.effect(
           status: "completed" | "failed" | "cancelled",
           extra: { result?: string; error?: string; reportedStatus?: ReturnStatus; reportedSummary?: string },
         ) =>
-          input.background && input.agentType !== "checkpoint-writer"
+          // An external cancel masks its own interrupt (runLoop.onInterrupt
+          // returns lastAssistant), so this fiber would otherwise emit a bogus
+          // "completed"/"failed". Defer to the terminal-status bridge, which
+          // emits the single authoritative "cancelled" notification.
+          cancelling.has(cancelKey(input.sessionID, input.actorID))
+            ? Effect.void
+            : input.background && input.agentType !== "checkpoint-writer"
             ? inbox
                 .send({
                   receiverSessionID: input.parentSessionID,
@@ -747,6 +765,56 @@ export const layer = Layer.effect(
       return yield* spawnSubagent(input)
     })
 
+    // === Unified terminal notification (T41) ===
+    // Single parent-notification contract for a terminal outcome. Completion and
+    // failure already notify directly from forkWork.notify on the woken/spawn
+    // turn; a CANCELLED child cannot, because its interrupt is masked by the
+    // runLoop.onInterrupt handler (returns lastAssistant) so the work fiber sees
+    // a spurious "success" and its own notify is suppressed via the `cancelling`
+    // set. `cancel` therefore emits the one authoritative cancelled notification
+    // here, reusing the exact shape forkWork.notify uses (renderActorNotification
+    // + actor_notification inbox message + a TUI toast). Gating (background,
+    // non-system peer/subagent) matches forkWork.notify so cancel/success/fail
+    // stay a single contract with no double-notify. Best-effort: a missing row
+    // or unresolved parent silently no-ops.
+    const notifyTerminal = (
+      sessionID: SessionID,
+      actorID: string,
+      actor: Actor | undefined,
+      status: "cancelled",
+    ) =>
+      Effect.gen(function* () {
+        if (!actor) return
+        if (!actor.background) return
+        if (actor.mode !== "peer" && actor.mode !== "subagent") return
+        if (SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)) return
+        // Resolve the parent session: a peer runs in its own child session (notify
+        // its parentID); a subagent shares the parent's session.
+        const parentSessionID =
+          actor.mode === "peer" ? (yield* session.get(sessionID)).parentID : sessionID
+        if (!parentSessionID) return
+        yield* inbox
+          .send({
+            receiverSessionID: parentSessionID,
+            receiverActorID: actor.parentActorID ?? "main",
+            senderSessionID: sessionID,
+            senderActorID: actorID,
+            type: "actor_notification",
+            content: renderActorNotification({
+              actorID,
+              description: actor.description,
+              status,
+            }),
+          })
+          .pipe(Effect.ignore)
+        yield* Effect.promise(() =>
+          Bus.publish(TuiEvent.ToastShow, {
+            message: `Child "${actor.description}" ${status}`,
+            variant: "info",
+          }),
+        ).pipe(Effect.ignore)
+      }).pipe(Effect.catchCause((cause) => Effect.logError(`terminal notify failed: ${cause}`)))
+
     const cancel: (sessionID: SessionID, actorID: string, mode: "graceful" | "forced") => Effect.Effect<void> =
       Effect.fn("Actor.cancel")(function* (sessionID: SessionID, actorID: string, mode: "graceful" | "forced") {
         const children = yield* actorReg.listByParent(sessionID, actorID)
@@ -754,10 +822,18 @@ export const layer = Layer.effect(
           concurrency: "unbounded",
           discard: true,
         })
+        // Mark cancelling BEFORE interrupting so forkWork.notify (which fires on
+        // the interrupt-masked "success") suppresses its own emit; the single
+        // authoritative "cancelled" notification is emitted below instead.
+        yield* Effect.sync(() => cancelling.add(cancelKey(sessionID, actorID)))
+        // Snapshot the actor row before cancelActor tears state down — we need
+        // its mode/agent/background/parentActorID to decide + address the notify.
+        const actor = yield* actorReg.get(sessionID, actorID)
         yield* state.cancelActor(sessionID, actorID)
         yield* actorReg
           .updateStatus(sessionID, actorID, { status: "idle", lastOutcome: "cancelled" })
           .pipe(Effect.ignore)
+        yield* notifyTerminal(sessionID, actorID, actor, "cancelled")
         yield* Effect.sync(() => forkContexts.delete(actorID))
       })
 
