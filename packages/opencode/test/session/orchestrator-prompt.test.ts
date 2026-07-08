@@ -65,6 +65,16 @@ describe("orchestrator prompt", () => {
     expect(PROMPT_ORCHESTRATOR).toMatch(/isolation-first|DEFAULT|MUST/i)
   })
 
+  test("makes requirement auto-capture a first-class reflex before acting (T45)", () => {
+    // The orchestrator must capture every user-stated requirement/bug/criticism/
+    // new problem into the task ledger as a reflex BEFORE acting, so 'talking'
+    // always becomes 'recording' — not left to self-discipline.
+    expect(PROMPT_ORCHESTRATOR).toContain("Capture requirements before acting")
+    expect(PROMPT_ORCHESTRATOR).toMatch(/talking.*recording|recording.*talking/i)
+    expect(PROMPT_ORCHESTRATOR).toMatch(/reflex/i)
+    expect(PROMPT_ORCHESTRATOR).toMatch(/bug|criticism|requirement/i)
+  })
+
   test("warns about idle-without-notification and detached-commit faults on resume", () => {
     // A child can go idle without sending a completion notification; and a
     // committed change can be detached from its branch ref. Pin the guidance to
