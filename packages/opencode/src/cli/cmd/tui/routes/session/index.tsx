@@ -586,21 +586,37 @@ export function Session() {
         name: "btw",
       },
       onSelect: async (dialog) => {
-        const question = await DialogPrompt.show(dialog, "/btw", {
-          placeholder: t("tui.command.session.ask.placeholder"),
-        })
-        if (!question || !question.trim()) return
-        const res = await sdk.client.session
-          .ask({ sessionID: route.sessionID, question: question.trim() })
-          .catch((error) => {
-            toast.show({
-              message: error instanceof Error ? error.message : "Failed to ask side question",
-              variant: "error",
-            })
-            return undefined
-          })
-        if (!res) return
-        await DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+        // Ask a read-only side question via fork-query. Keep the prompt dialog
+        // mounted in a busy/spinner state across the (multi-second) blocking
+        // `ask` so the user gets immediate feedback, then swap in the answer.
+        // READ-ONLY + EPHEMERAL: the answer is shown in a dismissible dialog and
+        // never injected into the conversation.
+        await DialogPrompt.ask(
+          dialog,
+          "/btw",
+          async (question, active) => {
+            const res = await sdk.client.session
+              .ask({ sessionID: route.sessionID, question })
+              .catch((error) => {
+                if (active())
+                  toast.show({
+                    message: error instanceof Error ? error.message : "Failed to ask side question",
+                    variant: "error",
+                  })
+                return undefined
+              })
+            if (!active()) return
+            if (!res) {
+              dialog.clear()
+              return
+            }
+            await DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+          },
+          {
+            placeholder: t("tui.command.session.ask.placeholder"),
+            busyText: t("tui.command.session.ask.busy"),
+          },
+        )
       },
     },
     {

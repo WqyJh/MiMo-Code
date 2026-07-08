@@ -444,6 +444,7 @@ export const dict = {
   "tui.command.session.ask.title": "Задать побочный вопрос",
   "tui.command.session.ask.description": "Задайте вопрос текущей сессии, не прерывая её",
   "tui.command.session.ask.placeholder": "Задайте побочный вопрос…",
+  "tui.command.session.ask.busy": "Думаю…",
   "tui.command.session.unshare.title": "Отменить публикацию",
   "tui.command.session.undo.title": "Отменить предыдущее сообщение",
   "tui.command.session.redo.title": "Повторить",

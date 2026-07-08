@@ -36,6 +36,7 @@ import { createColors, createFrames } from "../../ui/spinner.ts"
 import { useDialog } from "@tui/ui/dialog"
 import { DialogProvider as DialogProviderConnect } from "../dialog-provider"
 import { DialogAlert } from "../../ui/dialog-alert"
+import { DialogPrompt } from "../../ui/dialog-prompt"
 import { useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
@@ -1148,19 +1149,33 @@ export function Prompt(props: PromptProps) {
     } else if (inputText.startsWith("/btw ")) {
       // Inline side-question form: `/btw <question>` on the prompt line. Client
       // slashes match the exact `/btw` token and drop args, so handle the
-      // arg-bearing form here. READ-ONLY + EPHEMERAL: render the answer in a
-      // dismissible dialog, never inject it into the conversation.
+      // arg-bearing form here. Show a busy/spinner dialog immediately for
+      // instant feedback across the blocking fork-query, then swap in the
+      // answer. READ-ONLY + EPHEMERAL: render the answer in a dismissible
+      // dialog, never inject it into the conversation.
       const question = inputText.slice("/btw ".length).trim()
       if (question)
-        void sdk.client.session
-          .ask({ sessionID, question })
-          .then((res) => DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)"))
-          .catch((err) => {
-            toast.show({
-              message: err instanceof Error ? err.message : "Failed to ask side question",
-              variant: "error",
-            })
-          })
+        void DialogPrompt.busy(
+          dialog,
+          "/btw",
+          question,
+          (active) =>
+            sdk.client.session
+              .ask({ sessionID, question })
+              .then((res) => {
+                if (!active()) return
+                return DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+              })
+              .catch((err) => {
+                if (!active()) return
+                dialog.clear()
+                toast.show({
+                  message: err instanceof Error ? err.message : "Failed to ask side question",
+                  variant: "error",
+                })
+              }),
+          { busyText: t("tui.command.session.ask.busy") },
+        )
     } else if (clientSlash) {
       clientSlash.onSelect?.()
     } else if (

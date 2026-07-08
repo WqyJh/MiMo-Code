@@ -373,6 +373,7 @@ export const dict: Record<string, string> = {
   "tui.command.session.ask.title": "Ask a side question",
   "tui.command.session.ask.description": "Ask the current session a question without disrupting it",
   "tui.command.session.ask.placeholder": "Ask a side question…",
+  "tui.command.session.ask.busy": "Thinking…",
   "tui.command.session.unshare.title": "Unshare session",
   "tui.command.session.undo.title": "Undo previous message",
   "tui.command.session.redo.title": "Redo",

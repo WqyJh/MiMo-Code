@@ -429,6 +429,7 @@ export const dict = {
   "tui.command.session.ask.title": "Poser une question annexe",
   "tui.command.session.ask.description": "Posez une question à la session actuelle sans la perturber",
   "tui.command.session.ask.placeholder": "Poser une question annexe…",
+  "tui.command.session.ask.busy": "Réflexion…",
   "tui.command.session.unshare.title": "Annuler le partage",
   "tui.command.session.undo.title": "Annuler le message précédent",
   "tui.command.session.redo.title": "Rétablir",

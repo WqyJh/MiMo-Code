@@ -358,6 +358,7 @@ export const dict = {
   "tui.command.session.ask.title": "提一个旁问",
   "tui.command.session.ask.description": "向当前会话提问而不打断它",
   "tui.command.session.ask.placeholder": "提一个旁问…",
+  "tui.command.session.ask.busy": "思考中…",
   "tui.command.session.unshare.title": "取消分享",
   "tui.command.session.undo.title": "撤销上一条消息",
   "tui.command.session.redo.title": "重做",

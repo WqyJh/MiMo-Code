@@ -373,6 +373,7 @@ export const dict = {
   "tui.command.session.ask.title": "サイド質問をする",
   "tui.command.session.ask.description": "現在のセッションを中断せずに質問する",
   "tui.command.session.ask.placeholder": "サイド質問を入力…",
+  "tui.command.session.ask.busy": "考え中…",
   "tui.command.session.unshare.title": "共有を解除",
   "tui.command.session.undo.title": "直前のメッセージを取り消す",
   "tui.command.session.redo.title": "やり直し",

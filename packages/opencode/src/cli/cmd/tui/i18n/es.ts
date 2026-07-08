@@ -440,6 +440,7 @@ export const dict = {
   "tui.command.session.ask.title": "Hacer una pregunta lateral",
   "tui.command.session.ask.description": "Pregunta a la sesión actual sin interrumpirla",
   "tui.command.session.ask.placeholder": "Haz una pregunta lateral…",
+  "tui.command.session.ask.busy": "Pensando…",
   "tui.command.session.unshare.title": "Dejar de compartir",
   "tui.command.session.undo.title": "Deshacer mensaje anterior",
   "tui.command.session.redo.title": "Rehacer",
