@@ -474,18 +474,24 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     }
     if (prev === "orchestrator" || enteringOrchestrator) return
     enteringOrchestrator = true
-    // If we're currently viewing a session (e.g. resumed via -c/-s into a
-    // build session), that session belongs to the LAUNCH directory and will
-    // not exist once we switch the SDK to orchestratorDir(). Leaving the route
-    // pointed at it makes the session route's session.get fail against the new
-    // directory and blank the view (blackscreen). Return to home FIRST so the
-    // view matches the healthy fresh-orchestrator-entry state: the composer is
-    // visible and submits the first message into the stashed root session.
-    if (route.data.type === "session") route.navigate({ type: "home" })
+    // If we're currently viewing a session that belongs to a DIFFERENT (launch)
+    // directory, that session will not exist once we switch the SDK to
+    // orchestratorDir(). Leaving the route pointed at it makes the session
+    // route's session.get fail against the new directory and blank the view
+    // (blackscreen — the T20 -c case). Return to home FIRST so the view matches
+    // the healthy fresh-orchestrator-entry state. But when we launched INSIDE
+    // the orchestrator dir (sdk.directory is already orchestratorDir(), the -s
+    // <orchestratorSessionID> direct-entry case), no dir switch happens: the
+    // route already points at the orchestrator root session and MUST be kept —
+    // redirecting to home here is the regression. So this navigation lives
+    // inside the async block, gated by the SAME `sdk.directory !== dir` check
+    // that gates the actual switch (race-free: uses the freshly-resolved dir,
+    // not the async-populated signal).
     void (async () => {
       try {
         const dir = await orchestratorDir()
         if (sdk.directory !== dir) {
+          if (route.data.type === "session") route.navigate({ type: "home" })
           await sdk.client.instance.dispose().catch(() => {})
           sdk.switchDirectory(dir)
           await sync.bootstrap()
