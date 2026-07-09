@@ -65,27 +65,59 @@ describe("Permission.ask forward mode", () => {
   )
 
   it.live(
-    "without a grant, the forward is recorded pending and a reply resolves+clears it (dedup)",
+    "granted background subagent: external_directory ask for the main checkout auto-approves",
     provideTmpdirInstance(() =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const perm = yield* Permission.Service
-          // Run the forwarded ask in the background (it would otherwise wait for a
-          // reply / the deny-timeout). Give it a tick to register the pending row.
-          const fiber = yield* perm
-            .ask(buildRequest({ forward: { parentSessionID: "ses_parent3" } }))
-            .pipe(Effect.forkScoped)
-          yield* Effect.sleep("50 millis")
-          const rec = forwardRef.findPendingByChild("ses_child")
-          expect(rec?.requestID).toBeDefined()
-          // Resolve it as if the user/orchestrator approved (the single convergent path).
-          yield* perm.reply({ requestID: rec!.requestID as never, reply: "once" })
-          const result = yield* Fiber.await(fiber)
-          expect(result._tag).toBe("Success")
-          // Dedup: the pending forward record is cleared (finalizer removePending).
-          expect(forwardRef.findPendingByChild("ses_child")).toBeUndefined()
-        }),
-      ),
+      Effect.gen(function* () {
+        // Orchestrator ran `grant-approval` for this child (or `all`). The
+        // subagent forwards its external_directory ask (decideAskRouting routes a
+        // granted background subagent to forward), and the standing grant
+        // resolves it allow without a human — this is the gap the fix closes.
+        forwardRef.setGrant("ses_orch", "ses_bg_child")
+        const perm = yield* Permission.Service
+        const result = yield* perm
+          .ask(
+            buildRequest({
+              permission: "external_directory" as never,
+              patterns: ["/Users/me/projects/mi/mimocode/*"],
+              always: ["/Users/me/projects/mi/mimocode/*"],
+              sessionID: "ses_bg_child" as never,
+              forward: { parentSessionID: "ses_orch" },
+            }),
+          )
+          .pipe(Effect.exit)
+        expect(result._tag).toBe("Success")
+        forwardRef.clearGrantsForParent("ses_orch")
+      }),
+    ),
+  )
+
+  it.live(
+    "ungranted foreign path for a background subagent still fails closed (interactive:false)",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        // No grant for this child. decideAskRouting keeps it non-interactive, so
+        // the ask (interactive:false) denies immediately — a random foreign path
+        // like /tmp/foreign never auto-approves.
+        const perm = yield* Permission.Service
+        let asked = 0
+        const unsub = Bus.subscribe(Permission.Event.Asked, () => {
+          asked += 1
+        })
+        const result = yield* perm
+          .ask(
+            buildRequest({
+              permission: "external_directory" as never,
+              patterns: ["/tmp/foreign/*"],
+              always: ["/tmp/foreign/*"],
+              sessionID: "ses_ungranted" as never,
+              interactive: false,
+            }),
+          )
+          .pipe(Effect.exit)
+        unsub()
+        expect(result._tag).toBe("Failure")
+        expect(asked).toBe(0)
+      }),
     ),
   )
 })

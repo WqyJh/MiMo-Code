@@ -9,6 +9,7 @@ import { SessionRevert } from "./revert"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
 import { decideAskRouting, SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
+import { forwardRef } from "@/permission/permission-forward-ref"
 import { renderActorNotification } from "@/inbox/render"
 import { parseReturnHeader } from "@/actor/return-header"
 import { Provider } from "../provider"
@@ -874,8 +875,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         ? yield* actorRegistry.get(input.session.id, input.agentID)
         : undefined
       // Three-way permission-ask routing (see decideAskRouting): system agent ->
-      // auto-deny; orchestrator peer -> FORWARD for approval; other background ->
-      // auto-deny; normal -> interactive.
+      // auto-deny; orchestrator peer -> FORWARD for approval; GRANTED background
+      // subagent -> FORWARD (standing grant short-circuits to allow); other
+      // background -> auto-deny; normal -> interactive. grantResolved is resolved
+      // HERE (not in the pure fn) because it consults the process-global +
+      // on-disk grant table via forwardRef.grantAllowed.
+      const grantResolved =
+        Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR &&
+        !!askActor?.background &&
+        !!input.session.parentID &&
+        forwardRef.grantAllowed(input.session.parentID, input.session.id)
       const askRouting = decideAskRouting({
         askActor: askActor
           ? {
@@ -888,6 +897,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         sessionParentID: input.session.parentID,
         agentName: input.agent.name,
         orchestratorEnabled: Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR,
+        grantResolved,
       })
       const askInteractive = askRouting.interactive
       const askForward = askRouting.forward
