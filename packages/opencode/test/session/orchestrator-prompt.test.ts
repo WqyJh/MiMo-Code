@@ -107,4 +107,29 @@ describe("orchestrator prompt", () => {
     // `list` + `session send`.
     expect(PROMPT_ORCHESTRATOR).not.toContain("`actor` send action")
   })
+
+  test("finished sessions stay resumable — cancel is destroy-only, never the way to finish (T60)", () => {
+    // Governing principle: the orchestrator↔session interaction must mirror
+    // human↔session — a finished child goes idle and resumable, it is NOT
+    // cancelled on completion. Pin the principle vocabulary so it can't regress.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/resumable/i)
+    // The human-mirroring rationale must be stated.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/human/i)
+    // Cancel is reframed as a rare DESTROY action, not a completion step.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/DESTROY|destroy/)
+    // Read-only query over a finished child's preserved knowledge.
+    expect(PROMPT_ORCHESTRATOR).toContain("session ask")
+    // Explicit resume-first / do-not-cancel-on-completion instruction.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/do NOT cancel|never cancel|not cancel/i)
+    expect(PROMPT_ORCHESTRATOR).toMatch(/resume-first|Prefer keeping sessions resumable|Prefer resume/i)
+  })
+
+  test("no longer trains 'completed → cancel' as a routine completion step (T60)", () => {
+    // The defect: cancel must NOT be presented as the default way to finish a
+    // task. These 'completed → cancel' phrasings must be absent.
+    expect(PROMPT_ORCHESTRATOR).not.toMatch(/completed\s*→\s*cancel/i)
+    expect(PROMPT_ORCHESTRATOR).not.toContain("cancel + task done")
+    // "Completed" never means "cancel" — the explicit disavowal must be present.
+    expect(PROMPT_ORCHESTRATOR).toMatch(/"Completed" never means "cancel"|Completed.{0,20}never.{0,20}cancel/i)
+  })
 })
