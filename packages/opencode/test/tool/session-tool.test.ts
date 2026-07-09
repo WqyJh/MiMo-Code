@@ -18,6 +18,7 @@ import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider"
 import { Session } from "../../src/session"
 import { Worktree } from "../../src/worktree"
+import { Git } from "../../src/git"
 import { MessageID, SessionID, PartID } from "../../src/session/schema"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { TaskRegistry } from "../../src/task/registry"
@@ -45,6 +46,8 @@ const it = testEffect(
     Bus.defaultLayer,
     // session tool's create/cancel use Worktree.Service (worktree-per-child).
     Worktree.defaultLayer,
+    // session dashboard correlates worktrees via Git.Service (worktree list + rev-list).
+    Git.defaultLayer,
     // Actor.defaultLayer populates spawnRef.current, which the session tool's
     // create/cancel branches read via requireActor(). Without it they fail fast.
     Actor.defaultLayer,
@@ -1113,6 +1116,9 @@ function makeAskLayer() {
   return Layer.mergeAll(
     TestLLMServer.layer,
     inbox,
+    // Git.Service is part of SessionTool's Deps (dashboard worktree correlation);
+    // surface it so the test body can yield* SessionTool.
+    Git.defaultLayer,
     Actor.layer.pipe(
       Layer.provideMerge(prompt),
       Layer.provideMerge(Worktree.defaultLayer),

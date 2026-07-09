@@ -1,4 +1,6 @@
 import * as Tool from "./tool"
+import { realpathSync } from "fs"
+import path from "path"
 import DESCRIPTION from "./session.txt"
 import SHELL_DESCRIPTION from "./session.shell.txt"
 import { tokenize } from "./shell-tokenize"
@@ -20,11 +22,14 @@ import { inboxServiceRef } from "@/inbox/inbox-ref"
 import { prefixCaptureRef } from "@/session/prefix-capture-ref"
 import type { ForkContext, Interface as ActorInterface } from "@/actor/spawn"
 import { Bus } from "@/bus"
+import { Git } from "@/git"
 import { TuiEvent } from "@/cli/cmd/tui/event"
+import { assembleFleet, renderFleetTable } from "./fleet"
+import type { FleetActorInput, WorktreeEntry } from "./fleet"
 import type { SessionID, MessageID } from "../session/schema"
 import type { ProviderID, ModelID } from "../provider/schema"
 
-const KNOWN_VERBS = ["create", "send", "switch", "list", "status", "cancel", "ask", "join", "setmode", "approve", "grant-approval"]
+const KNOWN_VERBS = ["create", "send", "switch", "list", "dashboard", "status", "cancel", "ask", "join", "setmode", "approve", "grant-approval"]
 
 // Wraps the human/agent question in a side-boundary system-reminder:
 // one-shot, READ-ONLY, answer-to-caller.
@@ -135,7 +140,6 @@ export function forkQuery(deps: {
 
 function levenshtein(a: string, b: string): number {
   const m = a.length, n = b.length
-  if (m === 0) return n
   if (n === 0) return m
   const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0))
   for (let i = 0; i <= m; i++) dp[i][0] = i
@@ -214,6 +218,10 @@ const listOperation = z.strictObject({
   action: z.literal("list"),
 })
 
+const dashboardOperation = z.strictObject({
+  action: z.literal("dashboard"),
+})
+
 const statusOperation = z.strictObject({
   action: z.literal("status"),
   sessionID: z.string().min(1).describe("Child session id to report derived liveness for (progressing/stalled/terminal + turn telemetry)."),
@@ -274,7 +282,7 @@ const parameters = z.strictObject({
   // {"operation":"{\"action\":\"create\",...}"} which fails zod validation.
   // See research-tool-call-schema/REPORT.md §2.5 "success-nested" warning.
   operation: z
-    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, statusOperation, cancelOperation, askOperation, joinOperation, setmodeOperation, approveOperation, grantApprovalOperation])
+    .discriminatedUnion("action", [createOperation, sendOperation, switchOperation, listOperation, dashboardOperation, statusOperation, cancelOperation, askOperation, joinOperation, setmodeOperation, approveOperation, grantApprovalOperation])
     .meta({ type: "object" }),
 })
 
@@ -285,7 +293,7 @@ type Metadata = {
   sessionID?: string
 }
 
-type Deps = Session.Service | ActorRegistry.Service | Provider.Service | Worktree.Service | Bus.Service
+type Deps = Session.Service | ActorRegistry.Service | Provider.Service | Worktree.Service | Bus.Service | Git.Service
 
 function parseSessionScript(script: string): Effect.Effect<SessionOperation[], unknown> {
   return Effect.gen(function* () {
@@ -427,6 +435,12 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
       if (rest.length !== 0) return arityError("list", "", rest, line)
       return Effect.succeed({ operation: { action: "list" as const } })
     }
+    case "dashboard": {
+      const { rest, error } = extractSessionFlags(args, [])
+      if (error) return flagError("dashboard", error, line)
+      if (rest.length !== 0) return arityError("dashboard", "", rest, line)
+      return Effect.succeed({ operation: { action: "dashboard" as const } })
+    }
     case "status": {
       const { rest, error } = extractSessionFlags(args, [])
       if (error) return flagError("status", error, line)
@@ -499,6 +513,58 @@ function mapVerb(verb: string | undefined, args: string[], line: number): Effect
   }
 }
 
+// Enumerate the worktrees of the orchestrator's repo and, per branch, its
+// commits-ahead of the repo's default branch — the raw material assembleFleet
+// correlates to isolated child sessions by directory. Reads git through the
+// Git.Service (run + defaultBranch). `git worktree list --porcelain` emits
+// stanzas ("worktree <path>", "branch refs/heads/<b>", "detached", blank line);
+// we parse path + short branch, realpath-canonicalize the path so it matches a
+// session.directory, and compute ahead via `rev-list --count <base>..<branch>`.
+// Best-effort per entry: a failed rev-list leaves `ahead` undefined; a git
+// failure at the list step propagates to the caller's catch (→ no correlation).
+function collectWorktrees(git: Git.Interface, dir: string) {
+  return Effect.gen(function* () {
+    const list = yield* git.run(["worktree", "list", "--porcelain"], { cwd: dir })
+    if (list.exitCode !== 0) return [] as WorktreeEntry[]
+
+    const raw: { path: string; branch?: string }[] = []
+    for (const line of list.text().split("\n")) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith("worktree ")) raw.push({ path: trimmed.slice("worktree ".length).trim() })
+      else if (trimmed.startsWith("branch ")) {
+        const current = raw[raw.length - 1]
+        if (current) current.branch = trimmed.slice("branch ".length).trim().replace(/^refs\/heads\//, "")
+      }
+    }
+
+    const base = yield* git.defaultBranch(dir).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    const baseRef = base?.ref
+
+    return yield* Effect.forEach(raw, (entry) =>
+      Effect.gen(function* () {
+        const directory = yield* Effect.sync(() => {
+          try {
+            return realpathSync(entry.path)
+          } catch {
+            return path.normalize(entry.path)
+          }
+        })
+        let ahead: number | undefined
+        if (baseRef && entry.branch) {
+          const rev = yield* git
+            .run(["rev-list", "--count", `${baseRef}..${entry.branch}`], { cwd: dir })
+            .pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (rev && rev.exitCode === 0) {
+            const n = Number(rev.text().trim())
+            if (Number.isFinite(n)) ahead = n
+          }
+        }
+        return { directory, branch: entry.branch, ahead } satisfies WorktreeEntry
+      }),
+    )
+  })
+}
+
 export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
   id,
   Effect.gen(function* () {
@@ -507,6 +573,7 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
     const provider = yield* Provider.Service
     const worktreeSvc = yield* Worktree.Service
     const bus = yield* Bus.Service
+    const git = yield* Git.Service
 
     // Resolve the Actor service through the late-bound spawnRef rather than as a
     // Layer dependency: pulling Actor.Service into Deps would create a layer
@@ -796,6 +863,49 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
           metadata: {} as Metadata,
         }
       }
+
+      if (op.action === "dashboard") {
+        // Fleet observability: the same peer set as `list`, but correlated to
+        // (a) each child's derived liveness + turn telemetry, and (b) the git
+        // worktree backing isolated children (dir + branch + commits-ahead) —
+        // the mapping `list` never surfaced. Assembly is delegated to the pure
+        // assembleFleet/renderFleetTable (tool/fleet.ts); here we only gather
+        // the live inputs: sessions.children → actor rows → git worktree list.
+        const children = yield* sessions.children(ctx.sessionID as SessionID)
+        const enriched = yield* Effect.forEach(children, (child) =>
+          actorReg.get(child.id, child.id).pipe(Effect.map((actor) => ({ child, actor }))),
+        )
+        const peers = enriched.filter(
+          ({ actor }) => actor?.mode !== "subagent" && !(actor && SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)),
+        )
+        if (peers.length === 0)
+          return { title: "Fleet: 0", output: "No child sessions.", metadata: {} as Metadata }
+
+        // Correlate worktrees from the orchestrator's own repo. `git worktree
+        // list --porcelain` enumerates every worktree of the common repo (the
+        // isolated children live under <data>/worktree/... of it); we resolve
+        // each entry's directory to realpath so it matches a session.directory
+        // (which the create branch sets to the worktree dir). commits-ahead is
+        // computed per branch against the repo's default branch via rev-list.
+        // Best-effort: any git failure degrades to no worktree correlation
+        // rather than failing the dashboard.
+        const orchestratorDir = yield* InstanceState.directory
+        const worktrees = yield* collectWorktrees(git, orchestratorDir).pipe(
+          Effect.catch(() => Effect.succeed([] as WorktreeEntry[])),
+        )
+
+        const inputs: FleetActorInput[] = peers.map(({ child, actor }) => ({
+          session: { id: child.id, title: child.title, directory: child.directory },
+          actor: actor ?? null,
+        }))
+        const summary = assembleFleet(inputs, worktrees, Date.now())
+        return {
+          title: `Fleet: ${summary.total}`,
+          output: renderFleetTable(summary),
+          metadata: {} as Metadata,
+        }
+      }
+
 
       if (op.action === "status") {
         // Derived pull-side liveness for one child. A peer registers with
