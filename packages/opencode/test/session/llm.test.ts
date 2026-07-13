@@ -1266,19 +1266,20 @@ describe("session.llm.stream", () => {
     })
   })
 
-  // T63b follow-up: a Bedrock backend fronted by an Anthropic-messages gateway
-  // under a clean alias (providerID "anthropic", bare id "claude-opus-4-6")
-  // slips past ProviderTransform.supportsAssistantPrefill, so the proactive
-  // transform KEEPS the trailing assistant prefill and the gateway 400s with
-  // "does not support assistant message prefill". This asserts the reactive
-  // safety net: on that specific error body the stream retries exactly once with
-  // the trailing assistant pruned, and the second request ends with a user msg.
-  test("retries once dropping the trailing assistant prefill on a Bedrock/gateway prefill-rejection 400", async () => {
+  // Defensive backstop: the proactive transform now drops a trailing assistant
+  // prefill UNCONDITIONALLY for every provider, so attempt 1 already ends with a
+  // user message and we should never 400 on prefill. But if any path still
+  // produced a prefill-rejection 400 (e.g. a provider-side transform re-added a
+  // trailing assistant), the reactive one-shot retry must still recover. This
+  // simulates that 400 on attempt 1 and asserts the stream retries exactly once
+  // and succeeds, and that both requests already end with a user message (the
+  // proactive drop is in effect on both).
+  test("retries once on a prefill-rejection 400 (reactive backstop), even though the proactive drop already ran", async () => {
     const server = state.server
     if (!server) throw new Error("Server not initialized")
 
-    // Real user scenario: Anthropic-messages front door, bare claude id → the
-    // proactive detection does NOT flag it, so attempt 1 sends the prefill.
+    // Anthropic-messages front door, bare claude id: the OLD detection heuristic
+    // did NOT flag this, but the unconditional proactive drop applies regardless.
     const providerID = "anthropic"
     const modelID = "claude-opus-4-6"
     const fixture = await loadFixture(providerID, modelID)
@@ -1339,8 +1340,8 @@ describe("session.llm.stream", () => {
       directory: tmp.path,
       fn: async () => {
         const resolved = await getModel(ProviderID.make(providerID), ModelID.make(model.id))
-        // Sanity: this model is NOT proactively detected as prefill-rejecting,
-        // so attempt 1 genuinely sends the prefill (the bug's precondition).
+        // Sanity: a plain anthropic-messages model; the proactive drop applies to
+        // it like every other provider.
         expect(resolved.api.npm).toBe("@ai-sdk/anthropic")
 
         const sessionID = SessionID.make("session-prefill-retry")
@@ -1360,7 +1361,8 @@ describe("session.llm.stream", () => {
           model: { providerID: ProviderID.make(providerID), modelID: resolved.id },
         } satisfies MessageV2.User
 
-        // Conversation ends with an assistant (prefill) turn.
+        // Conversation ends with an assistant (prefill) turn — the proactive
+        // drop strips it before send, so attempt 1 already ends with a user msg.
         await drain({
           user,
           sessionID,
@@ -1381,9 +1383,12 @@ describe("session.llm.stream", () => {
         const firstMsgs = firstBody.messages as Array<{ role: string }>
         const secondMsgs = secondBody.messages as Array<{ role: string }>
 
-        // Attempt 1 sent the prefill (ended with assistant) → gateway 400'd.
-        expect(firstMsgs[firstMsgs.length - 1].role).toBe("assistant")
-        // Attempt 2 (the reactive retry) dropped it → ends with a user message.
+        // Proactive unconditional drop is in effect: attempt 1 already ends with
+        // a user message (we never send the trailing assistant prefill).
+        expect(firstMsgs.length).toBeGreaterThan(0)
+        expect(firstMsgs[firstMsgs.length - 1].role).toBe("user")
+        // The server still returned the prefill-rejection 400 on attempt 1, so
+        // the reactive backstop fired exactly once; attempt 2 also ends with user.
         expect(secondMsgs.length).toBeGreaterThan(0)
         expect(secondMsgs[secondMsgs.length - 1].role).toBe("user")
       },

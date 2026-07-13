@@ -364,13 +364,16 @@ const live: Layer.Layer<
       }
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
-      // Reactive prefill-rejection recovery: a Bedrock-backed model reached via
-      // an Anthropic-messages gateway can 400 on a trailing assistant (prefill)
-      // message that ProviderTransform.supportsAssistantPrefill failed to detect
-      // (clean alias id, non-bedrock providerID). On that specific 400 the stream
-      // re-runs with this flag set; drop the trailing assistant turn(s) so the
-      // resend ends with a user/tool message. The proactive transform still owns
-      // known-bedrock providers — this is only the safety net they miss.
+      // Reactive prefill-rejection backstop. The PRIMARY mechanism is now the
+      // unconditional proactive drop in ProviderTransform.message(): we never
+      // send a trailing assistant (prefill) turn to ANY provider, since our
+      // harness never intends one (every trailing-assistant case is residue) and
+      // no vendor recommends it. This reactive path is defense-in-depth: if any
+      // code path still slips a trailing assistant through to the wire (e.g. a
+      // provider-side transform re-adds one) and the backend 400s on it, the
+      // stream re-runs with this flag set to prune the trailing assistant turn(s)
+      // so the resend ends with a user/tool message. It should effectively never
+      // fire now, but keeping it is cheap and safe.
       const requestMessages = input.dropAssistantPrefill
         ? ProviderTransform.dropTrailingAssistantPrefill(input.messages)
         : input.messages
@@ -728,7 +731,7 @@ const live: Layer.Layer<
           ),
         )
 
-      // Promote the Bedrock/gateway prefill-rejection 400 — which arrives as an
+      // Promote a prefill-rejection 400 — which arrives as an
       // in-band `{ type: "error", error }` event, not a stream fault — into a
       // stream FAILURE so the reactive retry can catch it. `Stream.flatMap`
       // short-circuits every non-matching event straight through with a pure
@@ -744,15 +747,16 @@ const live: Layer.Layer<
           ),
         )
 
-      // Reactive prefill-rejection recovery. The proactive transform drops the
-      // trailing assistant prefill for providers we can identify as Bedrock, but
-      // a Bedrock backend fronted by an Anthropic-messages gateway under a clean
-      // alias (providerID "anthropic", bare id "claude-*") slips past that
-      // detection and 400s with "does not support assistant message prefill".
-      // Keying off that deterministic error body — not the model id — we retry
-      // exactly ONCE with the prefill pruned. Guarded to a single reprune so a
-      // persistent failure surfaces the retry's OWN error, falling back to the
-      // original prefill cause only when the resend is again prefill-rejected.
+      // Reactive prefill-rejection backstop. The proactive transform now drops a
+      // trailing assistant prefill UNCONDITIONALLY for every provider, so we
+      // should never send one and this path should effectively never fire. It
+      // remains as defense-in-depth: if any path still slips a trailing assistant
+      // through to the wire and the backend 400s with "does not support assistant
+      // message prefill", we key off that deterministic error body — not the
+      // model id — and retry exactly ONCE with the prefill pruned. Guarded to a
+      // single reprune so a persistent failure surfaces the retry's OWN error,
+      // falling back to the original prefill cause only when the resend is again
+      // prefill-rejected.
       return promotePrefillRejection(attempt(false)).pipe(
         Stream.catchCause((primaryCause) => {
           if (!ProviderTransform.isAssistantPrefillRejection(Cause.squash(primaryCause)))

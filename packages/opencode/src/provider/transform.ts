@@ -241,69 +241,26 @@ function supportsCacheMarkers(model: Provider.Model): boolean {
   return false
 }
 
-// Whether the provider/model accepts an "assistant prefill" — a trailing
-// assistant message that the model continues from. Anthropic-native genuinely
-// accepts it; the Bedrock Converse API rejects it with a non-retryable 400:
-// "This model does not support assistant message prefill. The conversation must
-// end with a user message."
+// A trailing assistant "prefill" — a conversation ending with an assistant
+// message the model would continue from — is a vendor-discouraged pattern that
+// some backends (notably the Bedrock Converse API) hard-400 on: "This model
+// does not support assistant message prefill. The conversation must end with a
+// user message." No vendor recommends prefill, and our harness never
+// intentionally constructs one: every trailing-assistant case is residue (an
+// interrupted generation, or a text-form-tool-call / invalid-output turn).
 //
-// The trap (T35 follow-up recurrence): a Bedrock-backed model can be reached
-// through an Anthropic-messages gateway (e.g. mimorouter.llmcore.ai.srv
-// /v1/messages), where the model carries npm "@ai-sdk/anthropic" and a
-// providerID with no "bedrock" in it (xiaomi, mimo, a router alias). Detecting
-// Bedrock by npm/providerID name alone misses that case, so the prefill is sent
-// and 400s (error body: "Service: BedrockRuntime").
+// So we drop it unconditionally for ALL providers rather than trying to guess
+// which backend is Bedrock (via npm/providerID name or a model-id namespace
+// heuristic), which was fragile — false-positive on native "mistral.large"-style
+// ids, and non-exhaustive on the vendor list. Dropping always is safe (we never
+// meant to send it) and provider-agnostic.
 //
-// The reliable runtime signal that survives the gateway is the model id itself:
-// Bedrock namespaces every hosted model as "<vendor>.<model>" (optionally with a
-// region/cross-region prefix, e.g. "anthropic.claude-3-5-sonnet",
-// "us.anthropic.claude-opus-4"). Anthropic-native / Vertex ids never carry that
-// dotted-vendor prefix ("claude-3-5-sonnet-20241022", "claude-sonnet-4@..."), so
-// matching it flags a Bedrock backend regardless of the front door without
-// touching genuine Anthropic.
-function supportsAssistantPrefill(model: Provider.Model): boolean {
-  // Bedrock Converse API rejects a trailing assistant message across all model
-  // families it hosts.
-  if (model.api.npm === "@ai-sdk/amazon-bedrock") return false
-  if (model.providerID.includes("bedrock")) return false
-  // Bedrock-backed model reached via a non-bedrock gateway: detect by the
-  // Bedrock model-id namespace (dotted-vendor prefix), which the gateway passes
-  // through even when npm/providerID say "anthropic".
-  if (isBedrockModelId(model.api.id) || isBedrockModelId(model.id)) return false
-  return true
-}
-
-// Bedrock model ids namespace the vendor before the model with a dot, optionally
-// behind a cross-region routing prefix: "anthropic.claude-3-5-sonnet",
-// "us.anthropic.claude-opus-4-6", "eu.meta.llama3-70b". Anthropic-native ids use
-// a bare "claude-*" / date / "@version" form with no such vendor.model segment.
+// Runs at the pre-send choke point in `message()`, so it also self-heals history
+// that already ends in an assistant turn (e.g. a retry after an interrupted
+// generation).
 //
-// Known tradeoff: a non-Bedrock provider that also exposes a dotted vendor id
-// (e.g. a native Mistral endpoint serving "mistral.large") would false-positive
-// here and get its trailing assistant prefill dropped. We deliberately do NOT
-// gate this on providerID/npm being Bedrock — the whole reason this check exists
-// is the gateway case where a Bedrock backend is reached under a clean alias
-// ("anthropic" providerID), which such a gate would miss again. The false
-// positive is low-impact (one dropped prefill, not an error) and is the safer
-// side to err on, since sending a prefill to a real Bedrock backend hard-400s.
-// The reactive error-body retry in session/llm.ts backs both directions: it
-// re-sends pruned only on the actual prefill-rejection 400, so a genuine miss
-// self-heals without relying on this id heuristic being perfect.
-function isBedrockModelId(id: string): boolean {
-  return /(^|[./])(anthropic|meta|amazon|cohere|mistral|ai21|deepseek)\.[a-z0-9]/i.test(id)
-}
-
-// Bedrock (and any other prefill-rejecting provider) 400s when the message list
-// ends with an assistant message. This drops trailing assistant message(s) so
-// the sent conversation ends with a user/tool message, matching the provider's
-// requirement. Anthropic-native and every other provider keep prefill intact
-// (supportsAssistantPrefill gates the call in `message()`).
-//
-// Runs at the pre-send choke point, so it also self-heals history that already
-// ends in an assistant turn (e.g. a retry after an interrupted generation).
-//
-// Exported so the reactive error-body retry in session/llm.ts can prune and
-// re-send when a gateway that name-matching missed rejects the prefill at 400.
+// Exported so the reactive error-body backstop in session/llm.ts can prune and
+// re-send if any path ever still slips a trailing assistant through to the wire.
 export function dropTrailingAssistantPrefill(msgs: ModelMessage[]): ModelMessage[] {
   let end = msgs.length
   while (end > 0 && msgs[end - 1].role === "assistant") end--
@@ -312,10 +269,12 @@ export function dropTrailingAssistantPrefill(msgs: ModelMessage[]): ModelMessage
 }
 
 // Signature of the non-retryable 400 a Bedrock Converse backend returns when the
-// conversation ends with an assistant (prefill) message — including when reached
-// through an Anthropic-messages gateway that exposes a clean model alias, so
-// supportsAssistantPrefill's id/providerID matching never flags it and the
-// prefill is sent anyway. The error body reads:
+// conversation ends with an assistant (prefill) message. The primary defense is
+// now the unconditional proactive drop in `message()`, so we should never send a
+// trailing assistant prefill in the first place. This regex backs the reactive
+// backstop in session/llm.ts: if any path still slips a trailing assistant
+// through to the wire (e.g. a provider-side transform re-adds one), we detect the
+// rejection and reprune. The error body reads:
 //   "This model does not support assistant message prefill. The conversation
 //    must end with a user message." (Service: BedrockRuntime)
 // Matching the deterministic failure text is provider-agnostic: it works
@@ -682,9 +641,7 @@ export function message(msgs: ModelMessage[], model: Provider.Model, options: Re
   msgs = unsupportedParts(msgs, model)
   msgs = limitImages(msgs, model)
   msgs = normalizeMessages(msgs, model, options)
-  if (!supportsAssistantPrefill(model)) {
-    msgs = dropTrailingAssistantPrefill(msgs)
-  }
+  msgs = dropTrailingAssistantPrefill(msgs)
   if (supportsCacheMarkers(model)) {
     msgs = applyCaching(msgs, model)
   }
