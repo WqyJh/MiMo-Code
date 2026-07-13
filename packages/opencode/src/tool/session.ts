@@ -805,9 +805,18 @@ export const SessionTool = Tool.define<typeof parameters, Metadata, Deps>(
         const children = yield* sessions.children(ctx.sessionID as SessionID)
         if (children.length === 0)
           return { title: "Child sessions: 0", output: "No child sessions.", metadata: {} as Metadata }
-        const peers = yield* Effect.forEach(children, (child) =>
+        const enriched = yield* Effect.forEach(children, (child) =>
           actorReg.get(child.id, child.id).pipe(Effect.map((actor) => ({ child, actor }))),
         )
+        // Exclude system subagents (checkpoint-writer, dream, distill, read-only
+        // forks) — they share the parentID linkage but register as mode:"subagent"
+        // with a system agent, and must not surface in the orchestrator's peer
+        // listing. Same filter as `dashboard` and the `status` branch.
+        const peers = enriched.filter(
+          ({ actor }) => actor?.mode !== "subagent" && !(actor && SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)),
+        )
+        if (peers.length === 0)
+          return { title: "Child sessions: 0", output: "No child sessions.", metadata: {} as Metadata }
         // The actor row's status enum is only pending|running|idle; a terminal
         // idle carries a lastOutcome (success/failure/cancelled). deriveLiveness
         // maps (status, lastOutcome, lastTurnTime) to a display bucket:
