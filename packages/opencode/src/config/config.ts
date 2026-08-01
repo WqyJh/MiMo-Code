@@ -270,7 +270,7 @@ const InfoSchema = Schema.Struct({
     Schema.Struct({
       thresholds: Schema.optional(Schema.Array(Schema.String)).annotate({
         description:
-          "Context fill thresholds that trigger checkpoint writes. Strings may be percentages (\"40%\"), absolute tokens (\"100K\", \"1.5M\"), or mixed (\"100K\", \"50%\"). Each threshold must be <= window - 20K reserved. Default: [\"40%\", \"60%\", \"80%\"].",
+          'Context fill thresholds that trigger checkpoint writes. Strings may be percentages ("40%"), absolute tokens ("100K", "1.5M"), or mixed ("100K", "50%"). Each threshold must be <= window - 20K reserved. Default: ["40%", "60%", "80%"].',
       }),
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer reserved for checkpoint operations. Default: 20000.",
@@ -308,16 +308,20 @@ const InfoSchema = Schema.Struct({
             description: "Token cap for the session notes (notes.md) of rebuild context. Default: 6000.",
           }),
           design_decisions: Schema.optional(PositiveInt).annotate({
-            description: "Token cap for §10 Design decisions section of checkpoint.md (writer-side budget validation). Default: 3000.",
+            description:
+              "Token cap for §10 Design decisions section of checkpoint.md (writer-side budget validation). Default: 3000.",
           }),
           open_notes: Schema.optional(PositiveInt).annotate({
-            description: "Token cap for §11 Open notes section of checkpoint.md (writer-side budget validation). Default: 800.",
+            description:
+              "Token cap for §11 Open notes section of checkpoint.md (writer-side budget validation). Default: 800.",
           }),
           recent_user: Schema.optional(NonNegativeInt).annotate({
-            description: "Token cap for the recent user input section (verbatim user messages from the live DB, FIFO eviction). Default: 16000. Set 0 to disable.",
+            description:
+              "Token cap for the recent user input section (verbatim user messages from the live DB, FIFO eviction). Default: 16000. Set 0 to disable.",
           }),
           recent_user_per_msg: Schema.optional(PositiveInt).annotate({
-            description: "Per-message cap inside recent user input section; oversized messages get head/tail truncation with messageID elision marker. Default: 2000.",
+            description:
+              "Per-message cap inside recent user input section; oversized messages get head/tail truncation with messageID elision marker. Default: 2000.",
           }),
         }),
       ).annotate({
@@ -325,7 +329,8 @@ const InfoSchema = Schema.Struct({
           "Per-section token caps for rebuild context (renderRebuildContext). Each section is loaded up to its cap so the rebuild stays within a predictable budget.",
       }),
       task_archive_days: Schema.optional(PositiveInt).annotate({
-        description: "Number of days after task done/abandoned before it's filtered out of `list({include_archived: false})`. Rows are NOT deleted — see v9 for true GC. Default: 7.",
+        description:
+          "Number of days after task done/abandoned before it's filtered out of `list({include_archived: false})`. Rows are NOT deleted — see v9 for true GC. Default: 7.",
       }),
       task_cleanup_days: Schema.optional(PositiveInt).annotate({
         description: "[deprecated] Alias for task_archive_days. Will be removed in v9.",
@@ -353,8 +358,7 @@ const InfoSchema = Schema.Struct({
   dream: Schema.optional(
     Schema.Struct({
       auto: Schema.optional(Schema.Boolean).annotate({
-        description:
-          "Auto-trigger dream memory consolidation on new session start. Default: false.",
+        description: "Auto-trigger dream memory consolidation on new session start. Default: false.",
       }),
       interval_days: Schema.optional(NonNegativeInt).annotate({
         description: "Minimum days between automatic dream runs. Set to 0 to trigger on every new session. Default: 7.",
@@ -364,8 +368,7 @@ const InfoSchema = Schema.Struct({
   distill: Schema.optional(
     Schema.Struct({
       auto: Schema.optional(Schema.Boolean).annotate({
-        description:
-          "Auto-trigger distill workflow packaging on new session start. Default: false.",
+        description: "Auto-trigger distill workflow packaging on new session start. Default: false.",
       }),
       interval_days: Schema.optional(NonNegativeInt).annotate({
         description: "Minimum days between automatic distill runs. Default: 30.",
@@ -485,6 +488,11 @@ export type Info = z.output<typeof Info> & {
   // plugin_origins is derived state, not a persisted config field. It keeps each winning plugin spec together
   // with the file and scope it came from so later runtime code can make location-sensitive decisions.
   plugin_origins?: ConfigPlugin.Origin[]
+  // Global/profile plugin declarations are retained independently from the
+  // ordinary winner list. A project-local declaration may override normal
+  // hooks, but must not erase a trusted root-completion provider with the same
+  // plugin identity.
+  completion_plugin_origins?: ConfigPlugin.Origin[]
   mcp_origins?: Record<string, ConfigMCP.Origin>
 }
 
@@ -536,7 +544,12 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
 }
 
 function writable(info: Info) {
-  const { plugin_origins: _plugin_origins, mcp_origins: _mcp_origins, ...next } = info
+  const {
+    plugin_origins: _plugin_origins,
+    completion_plugin_origins: _completion_plugin_origins,
+    mcp_origins: _mcp_origins,
+    ...next
+  } = info
   return next
 }
 
@@ -660,17 +673,12 @@ export const layer = Layer.effect(
       const gitignore = path.join(dir, ".gitignore")
       const hasIgnore = yield* fs.existsSafe(gitignore)
       if (!hasIgnore) {
-        yield* fs
-          .writeFileString(
-            gitignore,
-            MIMOCODE_GITIGNORE_ENTRIES.join("\n"),
-          )
-          .pipe(
-            Effect.catchIf(
-              (e) => e.reason._tag === "PermissionDenied",
-              () => Effect.void,
-            ),
-          )
+        yield* fs.writeFileString(gitignore, MIMOCODE_GITIGNORE_ENTRIES.join("\n")).pipe(
+          Effect.catchIf(
+            (e) => e.reason._tag === "PermissionDenied",
+            () => Effect.void,
+          ),
+        )
       }
     })
 
@@ -700,12 +708,16 @@ export const layer = Layer.effect(
         ) {
           if (!list?.length) return
           const hit = kind ?? (yield* pluginScopeForSource(source))
+          const origins = list.map((spec) => ({ spec, source, scope: hit }))
+          if (hit === "global") {
+            result.completion_plugin_origins = ConfigPlugin.deduplicatePluginOrigins([
+              ...(result.completion_plugin_origins ?? []),
+              ...origins,
+            ])
+          }
           // Merge newly seen plugin origins with previously collected ones, then dedupe by plugin identity while
           // keeping the winning source/scope metadata for downstream installs, writes, and diagnostics.
-          const plugins = ConfigPlugin.deduplicatePluginOrigins([
-            ...(result.plugin_origins ?? []),
-            ...list.map((spec) => ({ spec, source, scope: hit })),
-          ])
+          const plugins = ConfigPlugin.deduplicatePluginOrigins([...(result.plugin_origins ?? []), ...origins])
           result.plugin = plugins.map((item) => item.spec)
           result.plugin_origins = plugins
         })
@@ -827,7 +839,10 @@ export const layer = Layer.effect(
             for (const file of ["mimocode.json", "mimocode.jsonc"]) {
               const source = path.join(dir, file)
               log.debug(`loading config from ${source}`)
-              yield* merge(source, yield* loadFile(source))
+              // MIMOCODE_CONFIG_DIR is an explicit user/profile config root.
+              // Its plugins remain global even when tests or portable setups
+              // place that directory underneath the active workspace.
+              yield* merge(source, yield* loadFile(source), dir === Flag.MIMOCODE_CONFIG_DIR ? "global" : undefined)
               result.agent ??= {}
               result.mode ??= {}
               result.plugin ??= []

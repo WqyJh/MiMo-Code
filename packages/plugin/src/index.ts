@@ -230,8 +230,16 @@ export type AuthOuathResult = AuthOAuthResult
  * that are never spawned via the agent registry.
  */
 export const BUILT_IN_AGENTS = [
-  "main", "general", "build", "explore", "summary",
-  "title", "checkpoint-writer", "dream", "distill", "compaction",
+  "main",
+  "general",
+  "build",
+  "explore",
+  "summary",
+  "title",
+  "checkpoint-writer",
+  "dream",
+  "distill",
+  "compaction",
 ] as const
 
 export type BuiltInAgent = (typeof BUILT_IN_AGENTS)[number]
@@ -241,11 +249,7 @@ export type ActorOutcome = "success" | "failure" | "cancelled"
 
 export type ActorMatcher = {
   mode?: ActorMode
-  agentType?:
-    | string
-    | string[]
-    | { include: string[]; exclude?: string[] }
-    | { excludeOnly: string[] } // matches every agent (incl. built-ins) except those listed
+  agentType?: string | string[] | { include: string[]; exclude?: string[] } | { excludeOnly: string[] } // matches every agent (incl. built-ins) except those listed
 }
 
 export type ActorStopBaseInput = {
@@ -262,7 +266,7 @@ export type ActorStopBaseInput = {
   task: string
   description?: string
   finalText?: string
-  task_id?: string  // Spec ②: if set, postStop hooks can validate tasks/<task_id>/progress.md
+  task_id?: string // Spec ②: if set, postStop hooks can validate tasks/<task_id>/progress.md
   iteration: number
 }
 
@@ -270,7 +274,7 @@ export type ActorPreStopInput = ActorStopBaseInput
 
 export type ActorPostStopInput = ActorStopBaseInput & {
   outcome: ActorOutcome
-  error?: string  // outcome === "failure" 时存在
+  error?: string // outcome === "failure" 时存在
   // false → the spawned agent cannot use the Write tool (read-only, e.g. explore).
   // Absent/undefined → unknown; hooks must NOT suppress on absence (fail-open).
   canWrite?: boolean
@@ -281,23 +285,91 @@ export type ActorStopOutput = {
   reason?: string
 }
 
-export type ActorPreStopHook = (
-  input: ActorPreStopInput,
-  output: ActorStopOutput,
-) => Promise<void>
+export type ActorPreStopHook = (input: ActorPreStopInput, output: ActorStopOutput) => Promise<void>
 
-export type ActorPostStopHook = (
-  input: ActorPostStopInput,
-  output: ActorStopOutput,
-) => Promise<void>
+export type ActorPostStopHook = (input: ActorPostStopInput, output: ActorStopOutput) => Promise<void>
 
-export type ActorPreStopRegistration =
-  | ActorPreStopHook
-  | { matcher?: ActorMatcher; run: ActorPreStopHook }
+export type ActorPreStopRegistration = ActorPreStopHook | { matcher?: ActorMatcher; run: ActorPreStopHook }
 
-export type ActorPostStopRegistration =
-  | ActorPostStopHook
-  | { matcher?: ActorMatcher; run: ActorPostStopHook }
+export type ActorPostStopRegistration = ActorPostStopHook | { matcher?: ActorMatcher; run: ActorPostStopHook }
+
+// ----- Root session deterministic completion hook types -----
+
+export type SessionPreStopStatus = "allow" | "continue" | "awaiting_user" | "blocked"
+
+export type SessionPreStopNextAction = {
+  description?: string
+  /**
+   * Suggested argv only. The host never executes this command automatically;
+   * it is rendered into the synthetic continuation prompt for the agent.
+   */
+  command?: string[]
+}
+
+export type SessionPreStopInput = Readonly<{
+  sessionID: string
+  agentID: string
+  /** Current agent working directory; providers must not rely on process.cwd(). */
+  cwd: string
+  /** Current project/worktree root. */
+  root: string
+  taskId?: string
+  finalText?: string
+  assistantMessageID?: string
+  /** Stable identity of the current visible user turn, when one exists. */
+  visibleUserMessageID?: string
+  /** Last visible, non-synthetic user text for the current root turn. */
+  lastUserMessage?: string
+  /**
+   * Canonical names of successfully completed `skill` tool calls after the
+   * current visible user message. Deduplicated in call order and capped at 64.
+   */
+  loadedSkills: readonly string[]
+  /** Aborted by the host when this provider exceeds its completion-check deadline. */
+  abortSignal: AbortSignal
+}>
+
+export type SessionPreStopOutput = {
+  status: SessionPreStopStatus
+  taskId?: string
+  /** Stable digest of the provider-owned task state used for no-progress detection. */
+  stateDigest?: string
+  reason?: string
+  nextAction?: SessionPreStopNextAction
+}
+
+export type SessionPreStopHook = (input: SessionPreStopInput, output: SessionPreStopOutput) => Promise<void>
+
+/**
+ * Failure policy for a deterministic completion provider.
+ *
+ * Completion checks are fail-closed by default: an exception, timeout, or
+ * malformed response becomes a visible `blocked` terminal result. Providers
+ * that are advisory rather than authoritative may explicitly opt into `open`.
+ */
+export type SessionPreStopFailureMode = "closed" | "open"
+
+export type SessionPreStopRegistration =
+  | SessionPreStopHook
+  | {
+      run: SessionPreStopHook
+      failureMode?: SessionPreStopFailureMode
+    }
+
+/**
+ * Structured terminal decision emitted by the root completion gate.
+ *
+ * `session.post.outcome` remains the backwards-compatible three-value union;
+ * terminal completion-gate stops use `outcome: "cancelled"` and populate this
+ * field so newer consumers can distinguish a hard blocker from user input that
+ * is still required.
+ */
+export type SessionTerminalStop = Readonly<{
+  status: "awaiting_user" | "blocked"
+  reason: string
+  contributingProviderIDs: readonly string[]
+  contributingHookIDs: readonly string[]
+}>
 
 /**
  * Wire-format part inside a trajectory. Mirrors MessageV2.Part with full
@@ -463,7 +535,13 @@ export interface Hooks {
     output: { parts: Part[] },
   ) => Promise<void>
   "tool.execute.before"?: (
-    input: { tool: string; sessionID: string; callID: string },
+    input: {
+      tool: string
+      sessionID: string
+      callID: string
+      /** Stable identity of the current visible root-main user turn, when one exists. */
+      visibleUserMessageID?: string
+    },
     output: { args: any; cancel?: boolean; cancelReason?: string },
   ) => Promise<void>
   "shell.env"?: (
@@ -471,7 +549,14 @@ export interface Hooks {
     output: { env: Record<string, string> },
   ) => Promise<void>
   "tool.execute.after"?: (
-    input: { tool: string; sessionID: string; callID: string; args: any },
+    input: {
+      tool: string
+      sessionID: string
+      callID: string
+      args: any
+      /** Stable identity of the current visible root-main user turn, when one exists. */
+      visibleUserMessageID?: string
+    },
     output: {
       title: string
       output: string
@@ -555,10 +640,19 @@ export interface Hooks {
     output: { cancel?: boolean; cancelReason?: string },
   ) => Promise<void>
   /**
+   * Deterministic completion check immediately before the root main session is
+   * allowed to stop. Multiple plugin providers are isolated and aggregated by
+   * the host. `continue` requests another model turn; `allow`, `awaiting_user`,
+   * and `blocked` allow the current turn to stop.
+   */
+  "session.preStop"?: SessionPreStopRegistration
+  /**
    * Fires once when SessionPrompt.runLoop finishes — guaranteed to fire even on
    * thrown failures / interruptions (wired via Effect.onExit, not the success path).
-   * `outcome` is "cancelled" when either session.pre or any session.userQuery.pre
-   * set `output.cancel = true`; "error" on Effect failure or model error;
+   * `outcome` is "cancelled" when either session.pre / session.userQuery.pre
+   * cancels the run or when `session.preStop` produces a terminal stop;
+   * `terminalStop` distinguishes the latter without extending the established
+   * outcome union. It is "error" on Effect failure or model error and
    * "completed" otherwise.
    */
   "session.post"?: (
@@ -568,6 +662,8 @@ export interface Hooks {
       task_id?: string
       outcome: "completed" | "error" | "cancelled"
       error?: string
+      /** Present only when a deterministic completion provider stopped the turn. */
+      terminalStop?: SessionTerminalStop
       finalText?: string
       assistantMessageID?: string
       /** Full raw agent slice: user text, synthetic reminders, tool calls/results, reasoning, etc. */

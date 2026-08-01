@@ -1,6 +1,13 @@
 import type { TrajectoryMessage, TrajectoryPart } from "@mimo-ai/plugin"
 import { MessageV2 } from "./message-v2"
 
+/** Metadata marker for the host-authored, user-visible terminal completion notice. */
+export const SESSION_PRESTOP_TERMINAL_METADATA_KEY = "sessionPreStopTerminal"
+
+export function isSessionPreStopTerminalPart(part: MessageV2.Part): part is MessageV2.TextPart {
+  return part.type === "text" && part.metadata?.[SESSION_PRESTOP_TERMINAL_METADATA_KEY] !== undefined
+}
+
 /**
  * Replace `data:` URLs in file parts with a compact summary tag, leaving
  * non-data URLs (file paths, http(s) attachments) untouched. Keeps the
@@ -59,7 +66,9 @@ export function userQueryText(parts: MessageV2.Part[]): string {
 /** Last non-synthetic assistant text, or stringified structured output if present. */
 export function assistantFinalText(message: MessageV2.Assistant, parts: MessageV2.Part[]): string | undefined {
   if (message.structured !== undefined) return JSON.stringify(message.structured)
-  return parts.findLast((p): p is MessageV2.TextPart => p.type === "text" && !p.synthetic)?.text
+  return parts.findLast(
+    (p): p is MessageV2.TextPart => p.type === "text" && !p.synthetic && !isSessionPreStopTerminalPart(p),
+  )?.text
 }
 
 /**

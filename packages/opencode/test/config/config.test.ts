@@ -2391,11 +2391,14 @@ describe("MIMOCODE_DISABLE_PROJECT_CONFIG", () => {
       await using configDirTmp = await tmpdir({
         init: async (dir) => {
           // Create config in the custom config dir
+          const plugin = path.join(dir, "profile-plugin.ts")
+          await Filesystem.write(plugin, "export default async () => ({})\n")
           await Filesystem.write(
             path.join(dir, "mimocode.json"),
             JSON.stringify({
               $schema: "https://opencode.ai/config.json",
               model: "configdir/model",
+              plugin: [pathToFileURL(plugin).href],
             }),
           )
         },
@@ -2423,6 +2426,9 @@ describe("MIMOCODE_DISABLE_PROJECT_CONFIG", () => {
           const config = await load()
           // Should load from MIMOCODE_CONFIG_DIR, not project
           expect(config.model).toBe("configdir/model")
+          expect(config.completion_plugin_origins).toEqual([
+            expect.objectContaining({ source: path.join(configDirTmp.path, "mimocode.json"), scope: "global" }),
+          ])
         },
       })
     } finally {

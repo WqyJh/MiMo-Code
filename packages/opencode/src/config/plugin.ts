@@ -49,6 +49,11 @@ export function pluginOptions(plugin: Spec): Options | undefined {
   return Array.isArray(plugin) ? plugin[1] : undefined
 }
 
+export function pluginIdentity(plugin: Spec): string {
+  const spec = pluginSpecifier(plugin)
+  return spec.startsWith("file://") ? spec : parsePluginSpecifier(spec).pkg
+}
+
 // Path-like specs are resolved relative to the config file that declared them so merges later on do not
 // accidentally reinterpret `./plugin.ts` relative to some other directory.
 export async function resolvePluginSpec(plugin: Spec, configFilepath: string): Promise<Spec> {
@@ -75,8 +80,7 @@ export function deduplicatePluginOrigins(plugins: Origin[]): Origin[] {
   const list: Origin[] = []
 
   for (const plugin of plugins.toReversed()) {
-    const spec = pluginSpecifier(plugin.spec)
-    const name = spec.startsWith("file://") ? spec : parsePluginSpecifier(spec).pkg
+    const name = pluginIdentity(plugin.spec)
     if (seen.has(name)) continue
     seen.add(name)
     list.push(plugin)

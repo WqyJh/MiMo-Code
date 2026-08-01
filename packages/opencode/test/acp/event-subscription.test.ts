@@ -335,6 +335,188 @@ describe("acp.agent event subscription", () => {
     })
   })
 
+  test("projects terminal completion updates exactly once and makes later state changes explicit", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const { agent, controller, chunks, sessionUpdates, stop } = createFakeAgent()
+        const cwd = "/tmp/opencode-acp-terminal-test"
+        const sessionId = await agent.newSession({ cwd, mcpServers: [] } as any).then((x) => x.sessionId)
+        const messageID = "msg_terminal"
+        const partID = "part_terminal"
+        const updated = (text: string, terminal: boolean) => ({
+          directory: cwd,
+          payload: {
+            type: "message.part.updated",
+            properties: {
+              sessionID: sessionId,
+              time: Date.now(),
+              part: {
+                id: partID,
+                sessionID: sessionId,
+                messageID,
+                type: "text",
+                text,
+                ...(terminal ? { metadata: { sessionPreStopTerminal: { status: "blocked" } } } : {}),
+              },
+            },
+          },
+        })
+
+        controller.push(updated("ordinary completed text", false) as any)
+        controller.push(updated("first blocker", true) as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+
+        const initialChunks = sessionUpdates.filter(
+          (entry) => entry.sessionId === sessionId && entry.update.sessionUpdate === "agent_message_chunk",
+        )
+        expect(initialChunks).toHaveLength(1)
+        expect(chunks.get(sessionId)).toBe("first blocker")
+
+        controller.push(updated("replacement blocker", true) as any)
+        controller.push({
+          directory: cwd,
+          payload: {
+            type: "message.part.removed",
+            properties: { sessionID: sessionId, messageID, partID },
+          },
+        } as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+
+        expect(chunks.get(sessionId)).toContain("Completion check updated")
+        expect(chunks.get(sessionId)).toContain("replacement blocker")
+        expect(chunks.get(sessionId)).toContain("Completion check cleared")
+
+        stop()
+      },
+    })
+  })
+
+  test("retries terminal completion delivery and clearing after a transient ACP failure", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const { agent, controller, chunks, sessionUpdates, stop, connection } = createFakeAgent()
+        const cwd = "/tmp/opencode-acp-terminal-retry-test"
+        const sessionId = await agent.newSession({ cwd, mcpServers: [] } as any).then((x) => x.sessionId)
+        const messageID = "msg_terminal_retry"
+        const partID = "part_terminal_retry"
+        const originalSessionUpdate = connection.sessionUpdate.bind(connection)
+        let blockerFailures = 0
+        let clearFailures = 0
+        ;(connection as any).sessionUpdate = async (params: SessionUpdateParams) => {
+          const update = params.update
+          const text =
+            update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+              ? update.content.text
+              : undefined
+          if (text === "retry blocker" && blockerFailures++ === 0) throw new Error("transient blocker failure")
+          if (text?.includes("Completion check cleared") && clearFailures++ === 0) {
+            throw new Error("transient clear failure")
+          }
+          return originalSessionUpdate(params)
+        }
+        const terminalUpdate = {
+          directory: cwd,
+          payload: {
+            type: "message.part.updated",
+            properties: {
+              sessionID: sessionId,
+              time: Date.now(),
+              part: {
+                id: partID,
+                sessionID: sessionId,
+                messageID,
+                type: "text",
+                text: "retry blocker",
+                metadata: { sessionPreStopTerminal: { status: "blocked" } },
+              },
+            },
+          },
+        }
+        const removal = {
+          directory: cwd,
+          payload: {
+            type: "message.part.removed",
+            properties: { sessionID: sessionId, messageID, partID },
+          },
+        }
+
+        controller.push(terminalUpdate as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(chunks.get(sessionId)).toBeUndefined()
+
+        controller.push(terminalUpdate as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(chunks.get(sessionId)).toBe("retry blocker")
+
+        controller.push(removal as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(chunks.get(sessionId)).not.toContain("Completion check cleared")
+
+        controller.push(removal as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(chunks.get(sessionId)).toContain("Completion check cleared")
+        expect(sessionUpdates.filter((entry) => entry.update.sessionUpdate === "agent_message_chunk")).toHaveLength(2)
+
+        stop()
+      },
+    })
+  })
+
+  test("clears a terminal completion notice replayed by loadSession", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const { agent, controller, chunks, sessionUpdates, stop, sdk } = createFakeAgent()
+        const cwd = "/tmp/opencode-acp-terminal-replay-test"
+        const sessionId = await agent.newSession({ cwd, mcpServers: [] } as any).then((x) => x.sessionId)
+        const messageID = "msg_replayed_terminal"
+        const partID = "part_replayed_terminal"
+        sdk.session.messages = async () => ({
+          data: [
+            {
+              info: { id: messageID, role: "assistant", sessionID: sessionId },
+              parts: [
+                {
+                  id: partID,
+                  sessionID: sessionId,
+                  messageID,
+                  type: "text",
+                  text: "replayed blocker",
+                  metadata: { sessionPreStopTerminal: { status: "blocked" } },
+                },
+              ],
+            },
+          ],
+        })
+
+        await agent.loadSession({ sessionId, cwd, mcpServers: [] } as any)
+        expect(chunks.get(sessionId)).toBe("replayed blocker")
+
+        controller.push({
+          directory: cwd,
+          payload: {
+            type: "message.part.removed",
+            properties: { sessionID: sessionId, messageID, partID },
+          },
+        } as any)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+
+        const replayedChunks = sessionUpdates.filter(
+          (entry) => entry.sessionId === sessionId && entry.update.sessionUpdate === "agent_message_chunk",
+        )
+        expect(replayedChunks).toHaveLength(2)
+        expect(chunks.get(sessionId)).toContain("Completion check cleared")
+
+        stop()
+      },
+    })
+  })
+
   test("keeps concurrent sessions isolated when message.part.delta events are interleaved", async () => {
     await using tmp = await tmpdir()
     await Instance.provide({

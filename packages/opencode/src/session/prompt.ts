@@ -25,6 +25,7 @@ import {
 } from "ai"
 import { InstallationVersion } from "@/installation/version"
 import type { JSONObject, JSONSchema7 } from "@ai-sdk/provider"
+import type { SessionTerminalStop } from "@mimo-ai/plugin"
 import { SessionPrune } from "./prune"
 import { SessionCheckpoint } from "./checkpoint"
 import { SessionCompaction } from "./compaction"
@@ -37,7 +38,7 @@ import { ProviderTransform } from "../provider"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
 import { TuiEvent } from "@/cli/cmd/tui/event"
-import { Plugin } from "../plugin"
+import { Plugin, SESSION_PRESTOP_PROGRESS_METADATA_KEY, type SessionPreStopPersistedProgress } from "../plugin"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import PROMPT_COMPOSE from "../session/prompt/compose.txt"
@@ -78,6 +79,8 @@ import {
   userQueryText,
   assistantFinalText,
   sessionErrorText,
+  isSessionPreStopTerminalPart,
+  SESSION_PRESTOP_TERMINAL_METADATA_KEY,
 } from "./trajectory"
 import { prefixCaptureRef } from "./prefix-capture-ref"
 import { spawnRef } from "@/actor/spawn-ref"
@@ -107,7 +110,14 @@ import { Metrics } from "@/metrics"
 import { resolveInvocationStyle, type ToolStyleConfig } from "../tool/invocation-style"
 import { ToolResultError } from "../tool/result-error"
 import { RecoverableError } from "../tool/recoverable"
-import { shouldAutoDream, shouldAutoDistill, DREAM_TASK, DISTILL_TASK, AUTO_DREAM_TITLE, AUTO_DISTILL_TITLE } from "./auto-dream"
+import {
+  shouldAutoDream,
+  shouldAutoDistill,
+  DREAM_TASK,
+  DISTILL_TASK,
+  AUTO_DREAM_TITLE,
+  AUTO_DISTILL_TITLE,
+} from "./auto-dream"
 import { skillSearchReminderForSession } from "./skill-search-reminder"
 import {
   createMcpToolSearchCatalog,
@@ -130,8 +140,7 @@ const SKILL_CATALOG_REMINDER_MARKER = "Skills available in this session:"
 // emit JSON and crash the shell parser). `memory` has no shell form, so it is
 // always JSON. Exported for unit testing.
 export function recallHintLines(toolCfg: ToolStyleConfig | undefined): string[] {
-  const taskHint =
-    resolveInvocationStyle(toolCfg, "task") === "shell" ? "- task list" : `- task({ operation: "list" })`
+  const taskHint = resolveInvocationStyle(toolCfg, "task") === "shell" ? "- task list" : `- task({ operation: "list" })`
   const actorHint =
     resolveInvocationStyle(toolCfg, "actor") === "shell"
       ? "- actor status <actor_id>"
@@ -150,7 +159,10 @@ export const ORCHESTRATOR_TITLE = "Orchestrator"
 // of a per-message auto-generated one, or undefined when normal auto-titling
 // applies. Pure + exported for unit testing. `agent` is the triggering agent's
 // name (e.g. "orchestrator"); `parentID` distinguishes root from child sessions.
-export function stableRootTitle(input: { agent: string | undefined; parentID: string | undefined }): string | undefined {
+export function stableRootTitle(input: {
+  agent: string | undefined
+  parentID: string | undefined
+}): string | undefined {
   if (input.parentID) return undefined
   if (input.agent === "orchestrator") return ORCHESTRATOR_TITLE
   return undefined
@@ -170,6 +182,7 @@ const MAX_GOAL_REACT = 12
  * signal the model is stuck repeating itself rather than making progress.
  */
 const REPEATED_STEP_THRESHOLD = 3
+const SESSION_PRESTOP_LOADED_SKILLS_LIMIT = 64
 
 /**
  * Deterministic JSON serialization with sorted object keys, so that two
@@ -208,6 +221,77 @@ function stepSignature(parts: MessageV2.Part[]): string | undefined {
   }
   if (segments.length === 0) return undefined
   return segments.join("\n")
+}
+
+/**
+ * Return the successful skill loads that belong to one visible user turn.
+ * The completed tool result's metadata is authoritative because it contains
+ * the resolved skill name; input.name is a compatibility fallback. This scans
+ * structured in-memory parts only and never serializes the transcript.
+ */
+function loadedSkillsAfterVisibleUser(
+  messages: MessageV2.WithParts[],
+  visibleUserMessageID: string | undefined,
+): string[] {
+  if (!visibleUserMessageID) return []
+  const boundary = messages.findLastIndex((message) => message.info.id === visibleUserMessageID)
+  if (boundary === -1) return []
+
+  const loaded = new Set<string>()
+  for (const message of messages.slice(boundary + 1)) {
+    for (const part of message.parts) {
+      if (part.type !== "tool" || part.tool !== "skill" || part.state.status !== "completed") continue
+      const metadataName = part.state.metadata.name
+      const inputName = part.state.input.name
+      const candidate = typeof metadataName === "string" && metadataName.trim() ? metadataName : inputName
+      if (typeof candidate !== "string") continue
+      const name = candidate.trim()
+      if (!name || loaded.has(name)) continue
+      loaded.add(name)
+      if (loaded.size === SESSION_PRESTOP_LOADED_SKILLS_LIMIT) return [...loaded]
+    }
+  }
+  return [...loaded]
+}
+
+function hasVisibleUserContent(parts: MessageV2.Part[]): boolean {
+  return userQueryText(parts).trim().length > 0 || parts.some((part) => part.type === "file")
+}
+
+/**
+ * Recover the active visible root turn from durable, uncompressed messages.
+ * Completion checks run after rebuild/compaction markers may have hidden the
+ * original user message from the model slice, but request binding and skill
+ * evidence must continue to refer to that original turn.
+ */
+function persistentVisibleTurn(sessionID: SessionID, agentID: string) {
+  const newestFirst: MessageV2.WithParts[] = []
+  let progressPart: MessageV2.TextPart | undefined
+  for (const message of MessageV2.stream(sessionID, { agentID })) {
+    newestFirst.push(message)
+    const messageProgressPart = message.parts.findLast(
+      (part): part is MessageV2.TextPart =>
+        part.type === "text" && part.metadata?.[SESSION_PRESTOP_PROGRESS_METADATA_KEY] !== undefined,
+    )
+    progressPart ??= messageProgressPart
+    if (message.info.role !== "user" || !hasVisibleUserContent(message.parts)) continue
+    const messages = [...newestFirst].reverse()
+    const text = userQueryText(message.parts).trim()
+    return {
+      messageID: message.info.id,
+      message: text || undefined,
+      loadedSkills: loadedSkillsAfterVisibleUser(messages, message.info.id),
+      progress: messageProgressPart?.metadata?.[SESSION_PRESTOP_PROGRESS_METADATA_KEY],
+      progressPart: messageProgressPart,
+    }
+  }
+  return {
+    messageID: undefined,
+    message: undefined,
+    loadedSkills: [] as string[],
+    progress: progressPart?.metadata?.[SESSION_PRESTOP_PROGRESS_METADATA_KEY],
+    progressPart,
+  }
 }
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
@@ -297,7 +381,12 @@ export const layer = Layer.effect(
     // only needs to pass string IDs.
     const capture: typeof prefixCaptureRef.current = (input) =>
       Effect.gen(function* () {
-        const empty = { system: [] as string[], tools: {} as Record<string, AITool>, inheritedMessages: [] as ModelMessage[], parentPermission: [] as Permission.Ruleset }
+        const empty = {
+          system: [] as string[],
+          tools: {} as Record<string, AITool>,
+          inheritedMessages: [] as ModelMessage[],
+          parentPermission: [] as Permission.Ruleset,
+        }
         const ag = yield* agents.get(input.agentName).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!ag) return empty
         const model = yield* provider
@@ -371,9 +460,7 @@ export const layer = Layer.effect(
       agent: string
       model: { providerID: string; id: string }
     }) {
-      const hasCP = yield* checkpoint
-        .hasCheckpoint(input.sessionID)
-        .pipe(Effect.catch(() => Effect.succeed(false)))
+      const hasCP = yield* checkpoint.hasCheckpoint(input.sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
       if (!hasCP) return false
 
       const boundary = yield* checkpoint
@@ -463,8 +550,7 @@ export const layer = Layer.effect(
       onWaitingForWriter?: Effect.Effect<void>
     }) {
       // 1. Whatever is already on disk.
-      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false))))
-        return "rebuilt" as const
+      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false)))) return "rebuilt" as const
 
       // 2. Distinguish "nothing to rebuild from" (may compact) from "checkpoint
       //    present but the insert failed" (must not compact).
@@ -480,9 +566,7 @@ export const layer = Layer.effect(
       //    silently defeated this whole helper. A usable checkpoint therefore
       //    requires the boundary too, which is exactly what
       //    `rebuildFromCheckpoint` needs (it reads `lastBoundary` at :411).
-      const hasCP = yield* checkpoint
-        .hasCheckpoint(input.sessionID)
-        .pipe(Effect.catch(() => Effect.succeed(false)))
+      const hasCP = yield* checkpoint.hasCheckpoint(input.sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
       const boundary = hasCP
         ? yield* checkpoint.lastBoundary(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         : undefined
@@ -520,17 +604,14 @@ export const layer = Layer.effect(
 
       if (input.onWaitingForWriter) yield* input.onWaitingForWriter
 
-      const writerOutcome = yield* checkpoint
-        .waitForWriter(input.sessionID)
-        .pipe(
-          Effect.timeout(input.writerWaitMs),
-          Effect.catch(() => Effect.succeed<"success" | "failure" | "no-writer">("failure")),
-        )
+      const writerOutcome = yield* checkpoint.waitForWriter(input.sessionID).pipe(
+        Effect.timeout(input.writerWaitMs),
+        Effect.catch(() => Effect.succeed<"success" | "failure" | "no-writer">("failure")),
+      )
       if (writerOutcome !== "success") return "writer-failed" as const
 
       // 4. Writer wrote a checkpoint — rebuild from it.
-      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false))))
-        return "rebuilt" as const
+      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false)))) return "rebuilt" as const
       return "insert-failed" as const
     })
 
@@ -585,7 +666,9 @@ export const layer = Layer.effect(
         if (Session.isDefaultTitle(input.session.title))
           yield* sessions
             .setTitle({ sessionID: input.session.id, title: stable })
-            .pipe(Effect.catchCause((cause) => elog.error("failed to set stable title", { error: Cause.squash(cause) })))
+            .pipe(
+              Effect.catchCause((cause) => elog.error("failed to set stable title", { error: Cause.squash(cause) })),
+            )
         return
       }
 
@@ -813,15 +896,15 @@ export const layer = Layer.effect(
         userMessage.parts.push(part)
       }
 
-      const composeModeMsg = input.messages.find(
-        (msg) => msg.info.role === "user" && msg.info.agent === "compose",
-      )
+      const composeModeMsg = input.messages.find((msg) => msg.info.role === "user" && msg.info.agent === "compose")
       if (composeModeMsg) {
         const ctx = yield* InstanceState.context
         const composeCfg = (yield* config.get()).compose
         const docsDir = ConfigCompose.resolveDocsDir(ctx.worktree, composeCfg)
-        const text = PROMPT_COMPOSE
-          .replace("{{compose_docs_dir}}", `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`)
+        const text = PROMPT_COMPOSE.replace(
+          "{{compose_docs_dir}}",
+          `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`,
+        )
         composeModeMsg.parts.unshift({
           id: PartID.ascending(),
           messageID: composeModeMsg.info.id,
@@ -870,61 +953,57 @@ ${entries}
           }),
         )
         const bodyText = userMessage.parts
-            .flatMap((p) => (p.type === "text" && !p.synthetic && !p.ignored ? [p.text] : []))
-            .join("\n")
-          const stripped = bodyText
-            .replace(/```[\s\S]*?```/g, " ")
-            .replace(/`[^`\n]*`/g, " ")
-          const mentioned: string[] = []
-          const seen = new Set<string>()
-          const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_:-]*)(?=[^A-Za-z0-9_:-]|$)/g
-          for (const m of stripped.matchAll(mentionRe)) {
-            const name = m[1]
-            if (!name || seen.has(name)) continue
-            if (!allSkills.some((s) => s.name === name)) continue
-            seen.add(name)
-            mentioned.push(name)
+          .flatMap((p) => (p.type === "text" && !p.synthetic && !p.ignored ? [p.text] : []))
+          .join("\n")
+        const stripped = bodyText.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ")
+        const mentioned: string[] = []
+        const seen = new Set<string>()
+        const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_:-]*)(?=[^A-Za-z0-9_:-]|$)/g
+        for (const m of stripped.matchAll(mentionRe)) {
+          const name = m[1]
+          if (!name || seen.has(name)) continue
+          if (!allSkills.some((s) => s.name === name)) continue
+          seen.add(name)
+          mentioned.push(name)
+        }
+
+        if (mentioned.length > 0) {
+          const MAX_AUTOLOAD = 3
+          const toLoad = mentioned.slice(0, MAX_AUTOLOAD)
+          const overflow = mentioned.slice(MAX_AUTOLOAD)
+          for (const name of toLoad) {
+            if (loaded.has(name)) continue
+            const info = allSkills.find((s) => s.name === name)
+            if (!info) continue
+            const part = yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: userMessage.info.id,
+              sessionID: userMessage.info.sessionID,
+              type: "text",
+              text: `<system-reminder>\n<skill_content name="${name}">\n${info.content}\n</skill_content>\n</system-reminder>`,
+              synthetic: true,
+            })
+            userMessage.parts.push(part)
           }
 
-          if (mentioned.length > 0) {
-            const MAX_AUTOLOAD = 3
-            const toLoad = mentioned.slice(0, MAX_AUTOLOAD)
-            const overflow = mentioned.slice(MAX_AUTOLOAD)
-            for (const name of toLoad) {
-              if (loaded.has(name)) continue
-              const info = allSkills.find((s) => s.name === name)
-              if (!info) continue
-              const part = yield* sessions.updatePart({
-                id: PartID.ascending(),
-                messageID: userMessage.info.id,
-                sessionID: userMessage.info.sessionID,
-                type: "text",
-                text: `<system-reminder>\n<skill_content name="${name}">\n${info.content}\n</skill_content>\n</system-reminder>`,
-                synthetic: true,
-              })
-              userMessage.parts.push(part)
-            }
-
-            const alreadyPlanned = userMessage.parts.some(
-              (part) =>
-                part.type === "text" &&
-                part.synthetic &&
-                !part.ignored &&
-                part.text.includes("The user has explicitly referenced multiple skills in this message:"),
-            )
-            if (mentioned.length >= 2 && !alreadyPlanned) {
-              const loadedHint = toLoad.length > 0
-                ? `SKILL.md for [${toLoad.join(", ")}] has been auto-loaded above.`
-                : ""
-              const overflowHint = overflow.length > 0
-                ? `For [${overflow.join(", ")}], use the Skill tool to load them on demand.`
-                : ""
-              const part = yield* sessions.updatePart({
-                id: PartID.ascending(),
-                messageID: userMessage.info.id,
-                sessionID: userMessage.info.sessionID,
-                type: "text",
-                text: `<system-reminder>
+          const alreadyPlanned = userMessage.parts.some(
+            (part) =>
+              part.type === "text" &&
+              part.synthetic &&
+              !part.ignored &&
+              part.text.includes("The user has explicitly referenced multiple skills in this message:"),
+          )
+          if (mentioned.length >= 2 && !alreadyPlanned) {
+            const loadedHint =
+              toLoad.length > 0 ? `SKILL.md for [${toLoad.join(", ")}] has been auto-loaded above.` : ""
+            const overflowHint =
+              overflow.length > 0 ? `For [${overflow.join(", ")}], use the Skill tool to load them on demand.` : ""
+            const part = yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: userMessage.info.id,
+              sessionID: userMessage.info.sessionID,
+              type: "text",
+              text: `<system-reminder>
 The user has explicitly referenced multiple skills in this message: ${mentioned.join(", ")}.
 ${loadedHint} ${overflowHint}
 
@@ -937,11 +1016,11 @@ Before starting work, complete an orchestration plan:
 
 Keep planning proportional to task complexity: for simple combinations, two or three sentences suffice.
 </system-reminder>`,
-                synthetic: true,
-              })
-              userMessage.parts.push(part)
-            }
+              synthetic: true,
+            })
+            userMessage.parts.push(part)
           }
+        }
       }
 
       if (input.agent.name !== "plan" && assistantMessage?.info.agent === "plan") {
@@ -1110,6 +1189,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       )
       const run = yield* runner()
       const promptOps = yield* ops()
+      const visibleUserMessageID =
+        input.agentID === "main" && !input.session.parentID
+          ? persistentVisibleTurn(input.session.id, input.agentID).messageID
+          : undefined
+      const toolHookTurn = visibleUserMessageID === undefined ? {} : { visibleUserMessageID }
 
       // Per-tool runtime whitelist: when the LLM call is being made on behalf
       // of a registered actor (subagent or peer), look up the actor row and,
@@ -1130,9 +1214,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       // instructions and checkpoint self-triggering for user background actors.
       // Fall back to the agent-name check if the actor row is missing (race /
       // unregistered) so a system actor can't slip through as interactive.
-      const askActor = input.agentID
-        ? yield* actorRegistry.get(input.session.id, input.agentID)
-        : undefined
+      const askActor = input.agentID ? yield* actorRegistry.get(input.session.id, input.agentID) : undefined
       // Three-way permission-ask routing (see decideAskRouting): system agent ->
       // auto-deny; orchestrator peer -> FORWARD for approval; ordinary background
       // subagent -> INHERIT the parent's held grants; normal -> interactive.
@@ -1244,7 +1326,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 const beforeOutput: { args: any; cancel?: boolean; cancelReason?: string } = { args }
                 yield* plugin.trigger(
                   "tool.execute.before",
-                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, ...toolHookTurn },
                   beforeOutput,
                 )
                 if (beforeOutput.cancel) {
@@ -1284,7 +1366,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
                 yield* plugin.trigger(
                   "tool.execute.after",
-                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args: beforeOutput.args },
+                  {
+                    tool: item.id,
+                    sessionID: ctx.sessionID,
+                    callID: ctx.callID,
+                    args: beforeOutput.args,
+                    ...toolHookTurn,
+                  },
                   output,
                 )
                 if (
@@ -1292,7 +1380,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   beforeOutput.args?.file_path &&
                   isExtensionPath(beforeOutput.args.file_path)
                 ) {
-                  yield* registry.reload().pipe(Effect.tapError((err) => Effect.sync(() => log.warn("extension reload failed", { error: err }))), Effect.ignore)
+                  yield* registry.reload().pipe(
+                    Effect.tapError((err) => Effect.sync(() => log.warn("extension reload failed", { error: err }))),
+                    Effect.ignore,
+                  )
                 }
                 yield* bus
                   .publish(Metrics.ToolCall, {
@@ -1390,12 +1481,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const mcpBeforeOutput: { args: any; cancel?: boolean; cancelReason?: string } = { args }
               yield* plugin.trigger(
                 "tool.execute.before",
-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
+                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, ...toolHookTurn },
                 mcpBeforeOutput,
               )
               if (mcpBeforeOutput.cancel) {
                 const cancelResult = {
-                  content: [{ type: "text" as const, text: mcpBeforeOutput.cancelReason || "Tool call cancelled by hook" }],
+                  content: [
+                    { type: "text" as const, text: mcpBeforeOutput.cancelReason || "Tool call cancelled by hook" },
+                  ],
                 }
                 yield* bus
                   .publish(Metrics.ToolCall, {
@@ -1415,7 +1508,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               )
               yield* plugin.trigger(
                 "tool.execute.after",
-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
+                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args, ...toolHookTurn },
                 result,
               )
 
@@ -1447,11 +1540,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               if (normalized.isError) {
                 return yield* Effect.fail(
-                  new ToolResultError(
-                    truncated.content.trim() || "MCP tool execution failed",
-                    metadata,
-                    attachments,
-                  ),
+                  new ToolResultError(truncated.content.trim() || "MCP tool execution failed", metadata, attachments),
                 )
               }
 
@@ -1483,9 +1572,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           )
         tools[key] = item
       }
-      mcpCatalog.current = createMcpToolSearchCatalog(
-        mcpSearchEntries.toSorted((a, b) => a.name.localeCompare(b.name)),
-      )
+      mcpCatalog.current = createMcpToolSearchCatalog(mcpSearchEntries.toSorted((a, b) => a.name.localeCompare(b.name)))
       if (useMcpToolSearch && tools[MCP_TOOL_SEARCH_ID]) {
         const cfg = yield* config.get()
         const usableTokens = usable({ cfg, model: input.model })
@@ -1509,9 +1596,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   cache: { read: 0, write: 0 },
                 },
                 model: input.model,
-                additionalTokens: Token.estimate(
-                  JSON.stringify(input.messages.slice(lastFinishedIndex + 1)),
-                ),
+                additionalTokens: Token.estimate(JSON.stringify(input.messages.slice(lastFinishedIndex + 1))),
               }) < 2,
             budget: mcpToolCatalogBudget({ usable: usableTokens, context: input.model.limit.context }),
           }),
@@ -1973,11 +2058,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     })
 
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const match = yield* sessions.findMessage(
-        sessionID,
-        (m) => m.info.role === "user" && !!m.info.model,
-        { agentID: "*" },
-      )
+      const match = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model, {
+        agentID: "*",
+      })
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel()
     })
@@ -2528,128 +2611,136 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       agentID?: string,
       task_id?: string,
       notifyParentOnComplete?: boolean,
-    ) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID, agentID?: string, task_id?: string, notifyParentOnComplete?: boolean) {
-        const ctx = yield* InstanceState.context
-        const slog = elog.with({ sessionID })
-        let structured: unknown | undefined
-        let step = 0
-        const session = yield* sessions.get(sessionID)
-        let lastFinishedForPrune: MessageV2.Assistant | undefined
-        let lastModelForPrune: Provider.Model | undefined
-        let outputLengthContinuations = 0
-        // Shared local counter for "model finished but produced nothing usable"
-        // (think-only / empty). T04's generic-invalid retries reuse this same
-        // counter — do not add a second one. Local to runLoop so a fresh user
-        // turn resets it (no cross-message pollution), same as outputLengthContinuations.
-        let invalidContinuations = 0
-        // structured-output 专用 retry：上限来自 lastUser.format.retryCount（默认 2），
-        // 与 invalidContinuations（generic invalid）分离，互不污染。局部于 runLoop，
-        // 新一轮用户 turn 自动归零。
-        let structuredRetries = 0
-        // Bounded retries for text-form tool calls (model wrote a tool call as
-        // prose text instead of a structured tool_use). Local to runLoop so each
-        // fresh user turn starts clean.
-        let textToolCallRetries = 0
-        const resolvedAgentID = agentID ?? "main"
-        const mcpContext: MCP.TurnContext = {
-          sessionId: sessionID,
-          turnId: ulid(),
-          actorId: resolvedAgentID,
-        }
-        // Tracks plugin-driven cancellation (session.pre OR any session.userQuery.pre)
-        // so session.post reports outcome="cancelled" instead of "error".
-        let cancelled = false
-        let cancelReason: string | undefined
-        let lastSystemPrompt: string[] | undefined = undefined
+    ) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(function* (
+      sessionID: SessionID,
+      agentID?: string,
+      task_id?: string,
+      notifyParentOnComplete?: boolean,
+    ) {
+      const ctx = yield* InstanceState.context
+      const slog = elog.with({ sessionID })
+      let structured: unknown | undefined
+      let step = 0
+      const session = yield* sessions.get(sessionID)
+      let lastFinishedForPrune: MessageV2.Assistant | undefined
+      let lastModelForPrune: Provider.Model | undefined
+      let outputLengthContinuations = 0
+      // Shared local counter for "model finished but produced nothing usable"
+      // (think-only / empty). T04's generic-invalid retries reuse this same
+      // counter — do not add a second one. Local to runLoop so a fresh user
+      // turn resets it (no cross-message pollution), same as outputLengthContinuations.
+      let invalidContinuations = 0
+      // structured-output 专用 retry：上限来自 lastUser.format.retryCount（默认 2），
+      // 与 invalidContinuations（generic invalid）分离，互不污染。局部于 runLoop，
+      // 新一轮用户 turn 自动归零。
+      let structuredRetries = 0
+      // Bounded retries for text-form tool calls (model wrote a tool call as
+      // prose text instead of a structured tool_use). Local to runLoop so each
+      // fresh user turn starts clean.
+      let textToolCallRetries = 0
+      const resolvedAgentID = agentID ?? "main"
+      const mcpContext: MCP.TurnContext = {
+        sessionId: sessionID,
+        turnId: ulid(),
+        actorId: resolvedAgentID,
+      }
+      // Tracks plugin-driven cancellation (session.pre OR any session.userQuery.pre)
+      // so session.post reports outcome="cancelled" instead of "error".
+      let cancelled = false
+      let cancelReason: string | undefined
+      // A deterministic completion-provider terminal stop is represented as
+      // cancelled to legacy lifecycle consumers, with this structured detail
+      // carried by session.post for callers that understand the extension.
+      let terminalStop: SessionTerminalStop | undefined
+      let lastSystemPrompt: string[] | undefined = undefined
 
-        // Fires session.post exactly once via Effect.onExit on the body below.
-        // Without this wrapper any yielded failure inside the while loop (provider
-        // error, network error, thrown defect) would skip the hook entirely.
-        //
-        // Trajectory parity: uses MessageV2.filterCompactedEffect with the session's
-        // contextFrom / contextWatermark so compaction boundaries trim history to
-        // what the agent actually saw, and child-session parent prefixes are
-        // included — matching session.userQuery.post semantics.
-        const firePostSession = (exit: Exit.Exit<MessageV2.WithParts, unknown>) =>
-          Effect.gen(function* () {
-            const sliceMsgs = yield* MessageV2.filterCompactedEffect(sessionID, {
-              contextFrom: session.contextFrom,
-              contextWatermark: session.contextWatermark,
-              agentID: resolvedAgentID,
-            }).pipe(Effect.catch(() => Effect.succeed([] as MessageV2.WithParts[])))
-            const lastSlice = sliceMsgs.findLast((m) => m.info.role === "assistant")
-            const finalAsst =
-              lastSlice && lastSlice.info.role === "assistant" ? lastSlice.info : undefined
-            const finalParts = lastSlice?.parts ?? []
-            const failed = Exit.isFailure(exit)
-            const finalIsError = !!finalAsst?.error
-            const outcome: "completed" | "error" | "cancelled" = cancelled
+      // Fires session.post exactly once via Effect.onExit on the body below.
+      // Without this wrapper any yielded failure inside the while loop (provider
+      // error, network error, thrown defect) would skip the hook entirely.
+      //
+      // Trajectory parity: uses MessageV2.filterCompactedEffect with the session's
+      // contextFrom / contextWatermark so compaction boundaries trim history to
+      // what the agent actually saw, and child-session parent prefixes are
+      // included — matching session.userQuery.post semantics.
+      const firePostSession = (exit: Exit.Exit<MessageV2.WithParts, unknown>) =>
+        Effect.gen(function* () {
+          const sliceMsgs = yield* MessageV2.filterCompactedEffect(sessionID, {
+            contextFrom: session.contextFrom,
+            contextWatermark: session.contextWatermark,
+            agentID: resolvedAgentID,
+          }).pipe(Effect.catch(() => Effect.succeed([] as MessageV2.WithParts[])))
+          const lastSlice = sliceMsgs.findLast((m) => m.info.role === "assistant")
+          const finalAsst = lastSlice && lastSlice.info.role === "assistant" ? lastSlice.info : undefined
+          const finalParts = lastSlice?.parts ?? []
+          const failed = Exit.isFailure(exit)
+          const finalIsError = !!finalAsst?.error
+          const outcome: "completed" | "error" | "cancelled" = cancelled
+            ? "cancelled"
+            : failed || finalIsError
+              ? "error"
+              : terminalStop
+                ? "cancelled"
+                : "completed"
+          const error = cancelled
+            ? cancelReason
+            : failed
+              ? Cause.pretty(exit.cause)
+              : finalIsError && finalAsst
+                ? sessionErrorText(finalAsst.error)
+                : terminalStop?.reason
+          const interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+          const lifecycleStatus: MCP.TurnStatus =
+            cancelled || interrupted
               ? "cancelled"
               : failed || finalIsError
                 ? "error"
-                : "completed"
-            const error = cancelled
-              ? cancelReason
-              : failed
-                ? Cause.pretty(exit.cause)
-                : finalAsst
-                  ? sessionErrorText(finalAsst.error)
-                  : undefined
-            const interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
-            const lifecycleStatus: MCP.TurnStatus =
-              cancelled || interrupted ? "cancelled" : failed || finalIsError ? "error" : "completed"
-            yield* Effect.all(
-              [
-                plugin
-                  .trigger(
-                    "session.post",
-                    {
-                      sessionID,
-                      agentID: resolvedAgentID,
-                      task_id,
-                      outcome,
-                      error,
-                      finalText: finalAsst ? assistantFinalText(finalAsst, finalParts) : undefined,
-                      assistantMessageID: finalAsst?.id,
-                      trajectory: serializeTrajectoryMessages(sliceMsgs),
-                      systemPrompt: lastSystemPrompt,
-                    },
-                    {},
-                  )
-                  .pipe(Effect.ignore),
-                mcp
-                  .clients()
-                  .pipe(
-                    Effect.flatMap((clients) => MCP.notifyTurnLifecycle(clients, mcpContext, lifecycleStatus)),
-                    Effect.ignore,
-                  ),
-              ],
-              { concurrency: "unbounded", discard: true },
-            )
-          }).pipe(Effect.ignore)
-
-        return yield* Effect.gen(function* () {
-          const preSession = { cancel: undefined as boolean | undefined, cancelReason: undefined as string | undefined }
-          yield* plugin.trigger(
-            "session.pre",
-            { sessionID, agentID: resolvedAgentID, task_id },
-            preSession,
+                : terminalStop
+                  ? "cancelled"
+                  : "completed"
+          yield* Effect.all(
+            [
+              plugin
+                .trigger(
+                  "session.post",
+                  {
+                    sessionID,
+                    agentID: resolvedAgentID,
+                    task_id,
+                    outcome,
+                    error,
+                    terminalStop,
+                    finalText: finalAsst ? assistantFinalText(finalAsst, finalParts) : undefined,
+                    assistantMessageID: finalAsst?.id,
+                    trajectory: serializeTrajectoryMessages(sliceMsgs),
+                    systemPrompt: lastSystemPrompt,
+                  },
+                  {},
+                )
+                .pipe(Effect.ignore),
+              mcp.clients().pipe(
+                Effect.flatMap((clients) => MCP.notifyTurnLifecycle(clients, mcpContext, lifecycleStatus)),
+                Effect.ignore,
+              ),
+            ],
+            { concurrency: "unbounded", discard: true },
           )
-          if (preSession.cancel) {
-            cancelled = true
-            cancelReason = preSession.cancelReason
-            return yield* Effect.fail(
-              new NamedError.Unknown({
-                message: preSession.cancelReason ?? "Session cancelled by plugin",
-              }),
-            )
-          }
+        }).pipe(Effect.ignore)
+
+      return yield* Effect.gen(function* () {
+        const preSession = { cancel: undefined as boolean | undefined, cancelReason: undefined as string | undefined }
+        yield* plugin.trigger("session.pre", { sessionID, agentID: resolvedAgentID, task_id }, preSession)
+        if (preSession.cancel) {
+          cancelled = true
+          cancelReason = preSession.cancelReason
+          return yield* Effect.fail(
+            new NamedError.Unknown({
+              message: preSession.cancelReason ?? "Session cancelled by plugin",
+            }),
+          )
+        }
         const agentMetrics = { tokens_in: 0, tokens_out: 0, files_changed: 0 }
         const trajectoryForStep = (currentMsgs: MessageV2.WithParts[], assistant: MessageV2.Assistant) =>
-          serializeTrajectoryMessages(
-            withAssistantParts(currentMsgs, assistant, MessageV2.parts(assistant.id)),
-          )
+          serializeTrajectoryMessages(withAssistantParts(currentMsgs, assistant, MessageV2.parts(assistant.id)))
 
         const publishAgentRequest = (phase: string, taskType: string) =>
           bus
@@ -2729,6 +2820,170 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
+        // Deterministic provider gate for root main only. Providers inspect
+        // their own durable task state; no transcript is serialized here. A
+        // continue decision becomes a synthetic user reminder. Suggested argv
+        // is prompt text only and is never executed by the host.
+        const sessionPreStopGate = Effect.fn("SessionPrompt.sessionPreStopGate")(function* (input: {
+          lastUser: MessageV2.User
+          assistant: MessageV2.Assistant
+          parts: MessageV2.Part[]
+        }) {
+          if (resolvedAgentID !== "main" || session.parentID) return "pass" as const
+          const visibleTurn = persistentVisibleTurn(sessionID, resolvedAgentID)
+          const decision = yield* plugin.triggerSessionPreStop({
+            sessionID,
+            agentID: resolvedAgentID,
+            cwd: input.assistant.path?.cwd ?? ctx.directory,
+            root: input.assistant.path?.root ?? ctx.worktree,
+            taskId: task_id,
+            finalText: assistantFinalText(input.assistant, input.parts),
+            assistantMessageID: input.assistant.id,
+            visibleUserMessageID: visibleTurn.messageID,
+            lastUserMessage: visibleTurn.message,
+            loadedSkills: visibleTurn.loadedSkills,
+            progress: visibleTurn.progress,
+          })
+          // Persist the host-owned convergence budget on an ignored part of
+          // the visible user turn. It never enters model context, but survives
+          // compaction, Instance disposal, and process restart. Writing an
+          // empty snapshot on allow is also the durable tombstone for prior
+          // continuation state.
+          const progressAnchorMessageID = visibleTurn.messageID ?? input.lastUser.id
+          const existingProgressPart =
+            visibleTurn.progressPart?.messageID === progressAnchorMessageID ? visibleTurn.progressPart : undefined
+          const progressPart = yield* sessions.updatePart({
+            id: existingProgressPart?.id ?? PartID.ascending(),
+            messageID: progressAnchorMessageID,
+            sessionID,
+            type: "text",
+            text: "",
+            synthetic: true,
+            ignored: true,
+            metadata: {
+              ...existingProgressPart?.metadata,
+              [SESSION_PRESTOP_PROGRESS_METADATA_KEY]: decision.progress satisfies SessionPreStopPersistedProgress,
+            },
+          } satisfies MessageV2.TextPart)
+          visibleTurn.progressPart = progressPart
+          visibleTurn.progress = decision.progress
+          const existing = input.parts.find(isSessionPreStopTerminalPart)
+          if (decision.status === "allow") {
+            if (existing) {
+              yield* sessions.removePart({
+                sessionID,
+                messageID: input.assistant.id,
+                partID: existing.id,
+              })
+            }
+            return "pass" as const
+          }
+          const actions = decision.nextActions.flatMap((action) => [
+            `- ${action.providerID}: ${action.description ?? "Suggested next action"}`,
+            ...(action.command ? [`  command argv: ${JSON.stringify(action.command)}`] : []),
+          ])
+          if (decision.status === "awaiting_user" || decision.status === "blocked") {
+            const providerList = decision.contributingProviderIDs.join(", ") || "unknown provider"
+            const reason =
+              decision.reason?.trim() ||
+              (decision.status === "blocked"
+                ? `Completion was blocked by ${providerList}.`
+                : `Completion requires user input requested by ${providerList}.`)
+            const detail: SessionTerminalStop = {
+              status: decision.status,
+              reason,
+              contributingProviderIDs: [...decision.contributingProviderIDs],
+              contributingHookIDs: [...decision.contributingHookIDs],
+            }
+            const text = [
+              decision.status === "blocked"
+                ? "### Completion check: blocked"
+                : "### Completion check: waiting for user input",
+              "",
+              reason,
+              "",
+              `Providers: ${providerList}`,
+              ...(actions.length > 0 ? ["", "Suggested next actions:", ...actions] : []),
+            ].join("\n")
+            const unchanged =
+              existing?.text === text &&
+              JSON.stringify(existing.metadata?.[SESSION_PRESTOP_TERMINAL_METADATA_KEY]) === JSON.stringify(detail)
+            if (!unchanged) {
+              const now = Date.now()
+              yield* sessions.updatePart({
+                id: existing?.id ?? PartID.ascending(),
+                messageID: input.assistant.id,
+                sessionID,
+                type: "text",
+                text,
+                time: { start: now, end: now },
+                metadata: {
+                  ...existing?.metadata,
+                  [SESSION_PRESTOP_TERMINAL_METADATA_KEY]: detail,
+                },
+              } satisfies MessageV2.TextPart)
+              // Every live surface consumes the authoritative PartUpdated.
+              // ACP handles this host-authored terminal part explicitly; a
+              // second generic PartDelta would append the same text in the
+              // TUI and web reducers and render the notice twice.
+            }
+            terminalStop = detail
+            yield* slog.info("session.preStop allowing terminal state", {
+              status: decision.status,
+              providers: decision.contributingProviderIDs,
+            })
+            return "stop" as const
+          }
+
+          if (existing) {
+            yield* sessions.removePart({
+              sessionID,
+              messageID: input.assistant.id,
+              partID: existing.id,
+            })
+          }
+
+          const reentry = yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            role: "user" as const,
+            sessionID,
+            agentID: input.lastUser.agentID,
+            agent: input.lastUser.agent,
+            model: input.lastUser.model,
+            tools: input.lastUser.tools,
+            format: input.lastUser.format,
+            time: { created: Date.now() },
+          })
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: reentry.id,
+            sessionID,
+            type: "text",
+            synthetic: true,
+            text: [
+              "<system-reminder>",
+              ...(decision.blockedReport
+                ? [
+                    "A deterministic completion provider reached the host's bounded completion safeguard.",
+                    "Do not retry the same action blindly. Use this turn to report this blocker clearly, including the provider reason and the suggested next action.",
+                  ]
+                : [
+                    "A deterministic completion provider found that the current task is not complete.",
+                    "Continue working and address the provider reason before stopping.",
+                  ]),
+              ...(decision.reason ? ["", "Provider reason:", decision.reason] : []),
+              ...(actions.length > 0 ? ["", "Suggested next actions:", ...actions] : []),
+              "",
+              "Command argv arrays are hints only. The host has not executed them and will not execute them automatically.",
+              "</system-reminder>",
+            ].join("\n"),
+          } satisfies MessageV2.TextPart)
+          yield* slog.info("session.preStop re-entering", {
+            providers: decision.contributingProviderIDs,
+            blockedReport: decision.blockedReport,
+          })
+          return "continue" as const
+        })
 
         // Goal stop-condition gate (main agent only). Before honoring a stop,
         // an independent judge model reads the transcript and decides whether
@@ -3043,8 +3298,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             })
             return false
           }
-          const recoveryText =
-            textNgramRecoveryAttempts === 0 ? TEXT_NGRAM_RECOVERY_REMIND : TEXT_NGRAM_RECOVERY_REPLAN
+          const recoveryText = textNgramRecoveryAttempts === 0 ? TEXT_NGRAM_RECOVERY_REMIND : TEXT_NGRAM_RECOVERY_REPLAN
           const reentry = yield* sessions.updateMessage({
             id: MessageID.ascending(),
             role: "user" as const,
@@ -3106,6 +3360,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         })
 
         while (true) {
+          // StructuredOutput belongs to one assistant step. A deterministic
+          // pre-stop continuation must not let a prior step's JSON terminate
+          // the next step before it produces its own structured result.
+          structured = undefined
+          let directCompletionGateEligible = false
           // F55: only main agent sets session status to busy; subagent runners
           // must not touch session-level status (Runner.onBusy is Effect.void
           // for non-main actors per F47).
@@ -3226,7 +3485,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
             if (classification.type === "final" && classification.degraded)
               yield* slog.warn("degraded final on abnormal finish", { finish: lastAssistant.finish })
-            if (classification.type !== "continue") {
+            if (classification.type === "final") {
+              const preStopDisposition = yield* sessionPreStopGate({
+                lastUser,
+                assistant: lastAssistant,
+                parts: lastAssistantMsg?.parts ?? [],
+              })
+              if (preStopDisposition === "continue") continue
+              if (preStopDisposition === "stop") {
+                yield* slog.info("exiting loop", { classification: classification.type })
+                break
+              }
               if (yield* goalGate(lastUser)) continue
               yield* slog.info("exiting loop", { classification: classification.type })
               break
@@ -3263,7 +3532,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     Effect.gen(function* () {
                       const s = yield* svc.create({ title: AUTO_DREAM_TITLE })
                       const sp = yield* Service
-                      yield* sp.prompt({ sessionID: s.id, agent: "dream", model: mdl, parts: [{ type: "text", text: DREAM_TASK }] })
+                      yield* sp.prompt({
+                        sessionID: s.id,
+                        agent: "dream",
+                        model: mdl,
+                        parts: [{ type: "text", text: DREAM_TASK }],
+                      })
                     }),
                   ),
                 ).catch((err) => log.error("auto-dream prompt failed", { error: String(err) }))
@@ -3274,7 +3548,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     Effect.gen(function* () {
                       const s = yield* svc.create({ title: AUTO_DISTILL_TITLE })
                       const sp = yield* Service
-                      yield* sp.prompt({ sessionID: s.id, agent: "distill", model: mdl, parts: [{ type: "text", text: DISTILL_TASK }] })
+                      yield* sp.prompt({
+                        sessionID: s.id,
+                        agent: "distill",
+                        model: mdl,
+                        parts: [{ type: "text", text: DISTILL_TASK }],
+                      })
                     }),
                   ),
                 ).catch((err) => log.error("auto-distill prompt failed", { error: String(err) }))
@@ -3289,9 +3568,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (Flag.MIMOCODE_EXPERIMENTAL_CRON) {
                 const workspaceRoot = (yield* InstanceState.context).worktree
                 const { CronBridge } = yield* Effect.promise(() => import("@/session/cron-bridge"))
-                AppRuntime.runPromise(
-                  CronBridge.use((b) => b.start(sessionID, workspaceRoot)),
-                ).catch((err) => log.error("cron-bridge start failed", { sessionID, error: String(err) }))
+                AppRuntime.runPromise(CronBridge.use((b) => b.start(sessionID, workspaceRoot))).catch((err) =>
+                  log.error("cron-bridge start failed", { sessionID, error: String(err) }),
+                )
               }
             }
           }
@@ -3351,9 +3630,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
               if (
                 lastUserMsg &&
-                !lastUserMsg.parts.some(
-                  (p) => p.type === "text" && p.text?.includes("repeating the same action"),
-                )
+                !lastUserMsg.parts.some((p) => p.type === "text" && p.text?.includes("repeating the same action"))
               ) {
                 lastUserMsg.parts.push({
                   id: PartID.ascending(),
@@ -3382,8 +3659,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // summary, checkpoint-writer) are exempt from context management;
           // see docs/superpowers/specs/2026-04-28-bounded-computation-agents-design.md
           const agent = yield* agents.get(lastUser.agent)
-          const isBoundedComputation =
-            agent?.native === true && agent?.hidden === true
+          const isBoundedComputation = agent?.native === true && agent?.hidden === true
 
           // Fire background checkpoint writers for any newly-crossed thresholds
           // based on the latest completed assistant message's tokens. These
@@ -3586,16 +3862,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // agent identity — which would diverge from the parent and break the
             // prefix cache.
             const actorRecord = lastUser.agentID
-              ? yield* actorRegistry.get(sessionID, lastUser.agentID).pipe(
-                  Effect.orElseSucceed(() => undefined),
-                )
+              ? yield* actorRegistry.get(sessionID, lastUser.agentID).pipe(Effect.orElseSucceed(() => undefined))
               : undefined
             // v9 registers main as `mode: "main"` with `contextMode: "full"`.
             // Only spawned actors (subagent/peer) carry a frozen ForkContext;
             // main is the captor, never the captured.
             const isForkAgent =
-              actorRecord?.contextMode === "full" &&
-              (actorRecord.mode === "subagent" || actorRecord.mode === "peer")
+              actorRecord?.contextMode === "full" && (actorRecord.mode === "subagent" || actorRecord.mode === "peer")
 
             // Fork path: read frozen ForkContext from Actor service (late-bound via
             // spawnRef to break the Actor → SessionPrompt → Actor layer cycle).
@@ -3610,7 +3883,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   agentID: lastUser.agentID,
                 })
                 yield* actorRegistry
-                  .updateStatus(sessionID, lastUser.agentID!, { status: "idle", lastOutcome: "failure", lastError: "missing fork context" })
+                  .updateStatus(sessionID, lastUser.agentID!, {
+                    status: "idle",
+                    lastOutcome: "failure",
+                    lastError: "missing fork context",
+                  })
                   .pipe(Effect.ignore)
                 return "break" as const
               }
@@ -3629,8 +3906,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // Schema parity with parent is currently a consequence of checkpoint-writer
               // having no toolAllowlist (Task 2.6 + agent.test.ts guard). See ForkContext.tools
               // JSDoc in packages/opencode/src/actor/spawn.ts for the full contract.
-              const queryParts =
-                msgs.findLast((m) => m.info.role === "user" && m.info.id === lastUser.id)?.parts ?? []
+              const queryParts = msgs.findLast((m) => m.info.role === "user" && m.info.id === lastUser.id)?.parts ?? []
               const query = userQueryText(queryParts)
               const preQuery = {
                 cancel: undefined as boolean | undefined,
@@ -3723,10 +3999,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   ),
                 )
 
-              if (
-                result === "continue" &&
-                (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))
-              ) {
+              if (result === "continue" && (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))) {
                 return "continue" as const
               }
 
@@ -3772,8 +4045,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 (forkClassification.type === "think-only" || forkClassification.type === "invalid") &&
                 format.type !== "json_schema"
               ) {
-                const reason =
-                  forkClassification.type === "invalid" ? forkClassification.reason : "think-only"
+                const reason = forkClassification.type === "invalid" ? forkClassification.reason : "think-only"
                 if (yield* autoContinueInvalidOutput({ lastUser, assistant: handle.message, reason }))
                   return "continue" as const
                 return "break" as const
@@ -3828,17 +4100,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // task creates, etc.) so each step doesn't replay from the bare
             // user prompt. The watermark is for fork capture only (frozen
             // snapshot of parent-view at spawn time).
-            const { system: prebuiltSystem, inheritedMessages: modelMsgs } =
-              yield* buildLLMRequestPrefix({
-                sessionID,
-                agent,
-                model,
-                msgs,
-                additions,
-              }).pipe(
-                Effect.provideService(LLM.Service, llm),
-                Effect.provideService(ToolRegistry.Service, registry),
-              )
+            const { system: prebuiltSystem, inheritedMessages: modelMsgs } = yield* buildLLMRequestPrefix({
+              sessionID,
+              agent,
+              model,
+              msgs,
+              additions,
+            }).pipe(Effect.provideService(LLM.Service, llm), Effect.provideService(ToolRegistry.Service, registry))
             lastSystemPrompt = prebuiltSystem
             const maxModeCfg = (yield* config.get()).experimental?.maxMode
             const useMaxMode =
@@ -3858,12 +4126,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               tools,
               activeTools,
               model,
-              toolChoice: isLastStep ? ("none" as const) : format.type === "json_schema" ? ("required" as const) : undefined,
+              toolChoice: isLastStep
+                ? ("none" as const)
+                : format.type === "json_schema"
+                  ? ("required" as const)
+                  : undefined,
               agentID: lastUser.agentID,
             }
 
-            const queryParts =
-              msgs.findLast((m) => m.info.role === "user" && m.info.id === lastUser.id)?.parts ?? []
+            const queryParts = msgs.findLast((m) => m.info.role === "user" && m.info.id === lastUser.id)?.parts ?? []
             const query = userQueryText(queryParts)
             const preQuery = {
               cancel: undefined as boolean | undefined,
@@ -3909,8 +4180,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   handle,
                   llm,
                   candidates: maxModeCfg?.candidates,
-                  setStatus: (message) =>
-                    status.set(sessionID, message ? { type: "busy", message } : { type: "busy" }),
+                  setStatus: (message) => status.set(sessionID, message ? { type: "busy", message } : { type: "busy" }),
                 })
               : handle.process(processArgs)
 
@@ -3927,9 +4197,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       query,
                       assistantMessageID: handle.message.id,
                       finish: handle.message.finish,
-                      error: Exit.isFailure(exit)
-                        ? Cause.pretty(exit.cause)
-                        : sessionErrorText(handle.message.error),
+                      error: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : sessionErrorText(handle.message.error),
                       finalText: assistantFinalText(handle.message, MessageV2.parts(handle.message.id)),
                       trajectory: trajectoryForStep(msgs, handle.message),
                       systemPrompt: lastSystemPrompt,
@@ -3940,10 +4208,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               ),
             )
 
-            if (
-              result === "continue" &&
-              (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))
-            ) {
+            if (result === "continue" && (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))) {
               return "continue" as const
             }
 
@@ -3957,6 +4222,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
+              directCompletionGateEligible = true
               return "break" as const
             }
 
@@ -4083,8 +4349,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   })
                   break
                 }
-                const recoveryText =
-                  textLoopRecoveryAttempts === 0 ? RECOVERY_PROMPT_MILD : RECOVERY_PROMPT_STRONG
+                const recoveryText = textLoopRecoveryAttempts === 0 ? RECOVERY_PROMPT_MILD : RECOVERY_PROMPT_STRONG
                 // Create a NEW user message at the end of conversation (not append to original)
                 const reentry = yield* sessions.updateMessage({
                   id: MessageID.ascending(),
@@ -4114,6 +4379,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (outcome === "break") {
+            if (directCompletionGateEligible) {
+              const preStopDisposition = yield* sessionPreStopGate({
+                lastUser,
+                assistant: handle.message,
+                parts: completedParts,
+              })
+              if (preStopDisposition === "continue") continue
+              if (preStopDisposition === "stop") break
+            }
             if (yield* goalGate(lastUser)) continue
             break
           }
@@ -4134,13 +4408,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }
         const final = yield* lastAssistant(sessionID, agentID)
         const finalIsError = final.info.role === "assistant" && !!final.info.error
-        const lastUserForMetrics = yield* sessions.findMessage(
-          sessionID,
-          (m) => m.info.role === "user",
-          { agentID: "*" },
-        )
+        const lastUserForMetrics = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user", {
+          agentID: "*",
+        })
         yield* publishAgentRequest(
-          finalIsError ? "error" : "completed",
+          finalIsError ? "error" : terminalStop ? "cancelled" : "completed",
           Option.isSome(lastUserForMetrics) ? lastUserForMetrics.value.info.agent : final.info.agent,
         )
         // Woken-peer completion signal. forkWork.notify only wraps the FIRST
@@ -4153,14 +4425,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // is never set on the spawn turn, so turn 1 is not double-notified.
         if (notifyParentOnComplete && agentID && session.parentID) {
           const actor = yield* actorRegistry.get(sessionID, agentID)
-          if (
-            actor &&
-            actor.mode === "peer" &&
-            actor.background &&
-            !SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)
-          ) {
-            const finalText =
-              final.info.role === "assistant" ? assistantFinalText(final.info, final.parts) : undefined
+          if (actor && actor.mode === "peer" && actor.background && !SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)) {
+            const finalText = final.info.role === "assistant" ? assistantFinalText(final.info, final.parts) : undefined
             const parsed = parseReturnHeader(finalText)
             const status = finalIsError ? "failed" : "completed"
             yield* inbox
@@ -4187,9 +4453,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
         }
         return final
-        }).pipe(Effect.onExit(firePostSession), Effect.orDie)
-      },
-    )
+      }).pipe(Effect.onExit(firePostSession), Effect.orDie)
+    })
 
     const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
       "SessionPrompt.loop",
@@ -4292,9 +4557,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
         // Set busy status so the TUI shows a spinner while we wait on the
         // writer (cases 2/3) or assemble context (case 1).
-        yield* status.set(input.sessionID, { type: "busy", message: "Rebuilding context\u2026" }).pipe(
-          Effect.catch(() => Effect.void),
-        )
+        yield* status
+          .set(input.sessionID, { type: "busy", message: "Rebuilding context\u2026" })
+          .pipe(Effect.catch(() => Effect.void))
 
         // Cases 1-3 all run through the shared rebuildEnsuringCheckpoint helper:
         // it rebuilds from an existing checkpoint, or — on a cold session — spawns
@@ -4436,9 +4701,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       let parts: PromptInput["parts"]
       if (isSubtask) {
-        const promptText = cmd.source === "skill"
-          ? templateCommand + (input.arguments.trim() ? "\n\n" + input.arguments : "")
-          : (templateParts.find((y): y is typeof y & { type: "text"; text: string } => y.type === "text"))?.text ?? ""
+        const promptText =
+          cmd.source === "skill"
+            ? templateCommand + (input.arguments.trim() ? "\n\n" + input.arguments : "")
+            : (templateParts.find((y): y is typeof y & { type: "text"; text: string } => y.type === "text")?.text ?? "")
         parts = [
           {
             type: "subtask" as const,
@@ -4451,9 +4717,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         ]
       } else if (cmd.source === "skill") {
         // Body injection belongs to the mention scan in insertReminders, which keys off this leading token.
-        const visibleText = input.arguments.trim()
-          ? `/${input.command} ${input.arguments}`
-          : `/${input.command}`
+        const visibleText = input.arguments.trim() ? `/${input.command} ${input.arguments}` : `/${input.command}`
         const attachments = templateParts.filter((p): p is Exclude<typeof p, { type: "text" }> => p.type !== "text")
         parts = [{ type: "text" as const, text: visibleText }, ...attachments, ...(input.parts ?? [])]
       } else {
@@ -4588,8 +4852,12 @@ export const PromptInput = z.object({
     ),
   agent: z.string().optional(),
   agentID: z.string().optional(),
-  task_id: z.string().optional()
-    .describe("If the spawning caller bound this prompt to a specific user-task (T4 etc), pass its TID. Propagates to Tool.Context.taskId so memory-path-guard allows writes to tasks/<task_id>/*.md."),
+  task_id: z
+    .string()
+    .optional()
+    .describe(
+      "If the spawning caller bound this prompt to a specific user-task (T4 etc), pass its TID. Propagates to Tool.Context.taskId so memory-path-guard allows writes to tasks/<task_id>/*.md.",
+    ),
   source: z.enum(["user", "spawn", "hook"]).optional(),
   provenance: MessageV2.Provenance.optional(),
   noReply: z.boolean().optional(),
@@ -4600,50 +4868,52 @@ export const PromptInput = z.object({
   format: MessageV2.Format.optional(),
   system: z.string().optional(),
   variant: z.string().optional(),
-  parts: z.array(
-    z.discriminatedUnion("type", [
-      MessageV2.TextPart.omit({
-        messageID: true,
-        sessionID: true,
-      })
-        .partial({
-          id: true,
+  parts: z
+    .array(
+      z.discriminatedUnion("type", [
+        MessageV2.TextPart.omit({
+          messageID: true,
+          sessionID: true,
         })
-        .meta({
-          ref: "TextPartInput",
-        }),
-      MessageV2.FilePart.omit({
-        messageID: true,
-        sessionID: true,
-      })
-        .partial({
-          id: true,
+          .partial({
+            id: true,
+          })
+          .meta({
+            ref: "TextPartInput",
+          }),
+        MessageV2.FilePart.omit({
+          messageID: true,
+          sessionID: true,
         })
-        .meta({
-          ref: "FilePartInput",
-        }),
-      MessageV2.AgentPart.omit({
-        messageID: true,
-        sessionID: true,
-      })
-        .partial({
-          id: true,
+          .partial({
+            id: true,
+          })
+          .meta({
+            ref: "FilePartInput",
+          }),
+        MessageV2.AgentPart.omit({
+          messageID: true,
+          sessionID: true,
         })
-        .meta({
-          ref: "AgentPartInput",
-        }),
-      MessageV2.SubtaskPart.omit({
-        messageID: true,
-        sessionID: true,
-      })
-        .partial({
-          id: true,
+          .partial({
+            id: true,
+          })
+          .meta({
+            ref: "AgentPartInput",
+          }),
+        MessageV2.SubtaskPart.omit({
+          messageID: true,
+          sessionID: true,
         })
-        .meta({
-          ref: "SubtaskPartInput",
-        }),
-    ]),
-  ).min(1, "parts must contain at least one element"),
+          .partial({
+            id: true,
+          })
+          .meta({
+            ref: "SubtaskPartInput",
+          }),
+      ]),
+    )
+    .min(1, "parts must contain at least one element"),
 })
 export type PromptInput = z.infer<typeof PromptInput>
 

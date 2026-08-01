@@ -187,6 +187,66 @@ Plugins can subscribe to events as seen below in the Examples section. Here is a
 - `session.status`
 - `session.updated`
 
+#### Deterministic completion checks
+
+Use `session.preStop` when a root-session task has durable completion state
+outside the conversation. The hook runs after the model tries to finish and
+before MiMoCode accepts that stop. It can allow the stop, ask the Agent to
+continue, or expose a terminal blocker without copying a large task ledger into
+the prompt.
+
+Install authoritative file-based completion checks in the global plugin
+directory. Project-local file hooks are not trusted to decide whether a root
+session may stop, so their `session.preStop` registration is ignored. MiMoCode
+also never executes a provider's suggested command; it only shows the argv to
+the Agent as a next-action hint.
+
+```ts title="~/.config/mimocode/hooks/release-gate.ts"
+import type { Plugin } from "@mimo-ai/plugin"
+import { join } from "node:path"
+
+const readReleaseTask = async (cwd: string) => {
+  const file = Bun.file(join(cwd, ".release", "task.json"))
+  return (await file.exists()) ? file.json() : undefined
+}
+
+export const ReleaseGate: Plugin = async () => ({
+  "session.preStop": async (input, output) => {
+    const task = await readReleaseTask(input.cwd)
+    if (!task) return
+
+    output.taskId = task.id
+    output.stateDigest = task.digest
+    if (task.status === "complete") return
+
+    output.status = task.status === "waiting-for-user" ? "awaiting_user" : "continue"
+    output.reason = task.blocker ?? "The durable release checklist is incomplete."
+    output.nextAction = {
+      description: "Inspect the next unfinished release check",
+      command: ["release-tool", "status"],
+    }
+  },
+})
+```
+
+The output status is one of:
+
+- `allow`: accept the Agent's stop. This is the default when the provider does
+  not apply.
+- `continue`: inject the reason and next action as a synthetic continuation
+  turn.
+- `awaiting_user`: stop with a visible request for required user input.
+- `blocked`: stop with a visible deterministic blocker.
+
+Completion providers are fail-closed by default. An exception, malformed
+result, or three-second timeout becomes `blocked`. A non-authoritative advisory
+provider may explicitly use `{ run, failureMode: "open" }`. Providers should
+honor `input.abortSignal`, return a stable `stateDigest`, and keep their own
+state in a file or service instead of deriving completion from the model's
+final prose. MiMoCode bounds repeated continuation checks and gives the Agent
+one final turn to report a non-progressing blocker, preventing an infinite
+paid-model loop.
+
 #### Todo Events
 
 - `todo.updated`

@@ -49,6 +49,7 @@ import { LoadAPIKeyError } from "ai"
 import type { AssistantMessage, Event, OpencodeClient, SessionMessageResponse, ToolPart } from "@mimo-ai/sdk/v2"
 import { applyPatch } from "diff"
 import { InstallationVersion } from "@/installation/version"
+import { SESSION_PRESTOP_TERMINAL_METADATA_KEY } from "@/session/trajectory"
 
 type ModeOption = { id: string; name: string; description?: string }
 type ModelOption = { modelId: string; name: string }
@@ -144,6 +145,7 @@ export class Agent implements ACPAgent {
   private bashSnapshots = new Map<string, string>()
   private toolStarts = new Set<string>()
   private permissionQueues = new Map<string, Promise<void>>()
+  private terminalCompletionNotices = new Map<string, string>()
   private permissionOptions: PermissionOption[] = [
     { optionId: "once", kind: "allow_once", name: "Allow once" },
     { optionId: "always", kind: "allow_always", name: "Always allow" },
@@ -418,11 +420,73 @@ export class Agent implements ACPAgent {
           }
         }
 
+        // Ordinary assistant text is streamed through PartDelta. A terminal
+        // completion-gate notice is authored atomically after model streaming,
+        // so ACP must project its authoritative PartUpdated once. Emitting an
+        // additional generic delta would duplicate it in TUI/web clients.
+        if (
+          part.type === "text" &&
+          part.ignored !== true &&
+          part.metadata?.[SESSION_PRESTOP_TERMINAL_METADATA_KEY] !== undefined &&
+          part.text
+        ) {
+          const noticeKey = `${part.sessionID}\0${part.id}`
+          const previous = this.terminalCompletionNotices.get(noticeKey)
+          if (previous === part.text) return
+          const projectedText =
+            previous === undefined
+              ? part.text
+              : `\n\n### Completion check updated\n\nThe prior completion notice is superseded by this result:\n\n${part.text}`
+          const delivered = await this.connection
+            .sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                messageId: part.messageID,
+                content: { type: "text", text: projectedText },
+              },
+            })
+            .then(() => true)
+            .catch((error) => {
+              log.error("failed to send terminal completion notice to ACP", { error })
+              return false
+            })
+          if (delivered) this.rememberTerminalCompletionNotice(noticeKey, part.text)
+          return
+        }
+
         // ACP clients already know the prompt they just submitted, so replaying
         // live user parts duplicates the message. We still replay user history in
         // loadSession() and forkSession() via processMessage().
         if (part.type !== "text" && part.type !== "file") return
 
+        return
+      }
+
+      case "message.part.removed": {
+        const props = event.properties
+        const noticeKey = `${props.sessionID}\0${props.partID}`
+        if (!this.terminalCompletionNotices.has(noticeKey)) return
+        const session = this.sessionManager.tryGet(props.sessionID)
+        if (!session) return
+        const delivered = await this.connection
+          .sessionUpdate({
+            sessionId: session.id,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              messageId: props.messageID,
+              content: {
+                type: "text",
+                text: "\n\n### Completion check cleared\n\nThe prior deterministic completion notice no longer applies.",
+              },
+            },
+          })
+          .then(() => true)
+          .catch((error) => {
+            log.error("failed to clear terminal completion notice in ACP", { error })
+            return false
+          })
+        if (delivered) this.terminalCompletionNotices.delete(noticeKey)
         return
       }
 
@@ -913,8 +977,12 @@ export class Agent implements ACPAgent {
         }
       } else if (part.type === "text") {
         if (part.text) {
+          const terminalNoticeKey =
+            part.ignored !== true && part.metadata?.[SESSION_PRESTOP_TERMINAL_METADATA_KEY] !== undefined
+              ? `${sessionId}\0${part.id}`
+              : undefined
           const audience: Role[] | undefined = part.synthetic ? ["assistant"] : part.ignored ? ["user"] : undefined
-          await this.connection
+          const delivered = await this.connection
             .sessionUpdate({
               sessionId,
               update: {
@@ -927,9 +995,12 @@ export class Agent implements ACPAgent {
                 },
               },
             })
+            .then(() => true)
             .catch((err) => {
               log.error("failed to send text to ACP", { error: err })
+              return false
             })
+          if (delivered && terminalNoticeKey) this.rememberTerminalCompletionNotice(terminalNoticeKey, part.text)
         }
       } else if (part.type === "file") {
         // Replay file attachments as appropriate ACP content blocks.
@@ -1040,6 +1111,14 @@ export class Agent implements ACPAgent {
     const output = part.state.metadata["output"]
     if (typeof output !== "string") return
     return output
+  }
+
+  private rememberTerminalCompletionNotice(noticeKey: string, text: string) {
+    if (!this.terminalCompletionNotices.has(noticeKey) && this.terminalCompletionNotices.size >= 1024) {
+      const oldest = this.terminalCompletionNotices.keys().next().value
+      if (oldest) this.terminalCompletionNotices.delete(oldest)
+    }
+    this.terminalCompletionNotices.set(noticeKey, text)
   }
 
   private async toolStart(sessionId: string, part: ToolPart) {
