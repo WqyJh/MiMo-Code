@@ -16,6 +16,7 @@ import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 import { AppFileSystem } from "@mimo-ai/shared/filesystem"
 import { Plugin } from "../../src/plugin"
 import { Git } from "../../src/git"
+import { SessionCwd } from "../../src/tool/session-cwd"
 
 const runtime = ManagedRuntime.make(
   Layer.mergeAll(
@@ -187,6 +188,34 @@ describe("tool.bash", () => {
         )
         expect(result.metadata.exit).toBe(0)
         expect(result.metadata.output).toContain("test")
+      },
+    })
+  })
+
+  each("uses the Host-captured tool cwd even if the mutable session cwd changes", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const later = path.join(tmp.path, "later")
+    await fs.mkdir(later)
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const bash = await initBash()
+        SessionCwd.set(ctx.sessionID, later)
+        try {
+          const code = "process.stdout.write(process.cwd())"
+          const result = await Effect.runPromise(
+            bash.execute(
+              {
+                command: `${bin} -e ${evalarg(code)}`,
+                description: "print captured working directory",
+              },
+              { ...ctx, cwd: tmp.path },
+            ),
+          )
+          expect(Filesystem.normalizePath(result.output.trim())).toBe(Filesystem.normalizePath(tmp.path))
+        } finally {
+          SessionCwd.clear(ctx.sessionID)
+        }
       },
     })
   })

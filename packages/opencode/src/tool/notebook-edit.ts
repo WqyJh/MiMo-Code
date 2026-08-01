@@ -103,7 +103,7 @@ export const NotebookEditTool = Tool.define(
 
           const notebookPath = path.isAbsolute(params.notebook_path)
             ? params.notebook_path
-            : path.join(SessionCwd.get(ctx.sessionID), params.notebook_path)
+            : path.join(ctx.cwd ?? SessionCwd.get(ctx.sessionID), params.notebook_path)
 
           if (editMode !== "insert" && !params.cell_id) {
             throw new Error(`cell_id is required when edit_mode is "${editMode}"`)

@@ -40,8 +40,9 @@ export const GlobTool = Tool.define(
             },
           })
 
-          let search = params.path ?? SessionCwd.get(ctx.sessionID)
-          search = path.isAbsolute(search) ? search : path.resolve(SessionCwd.get(ctx.sessionID), search)
+          const effectiveCwd = ctx.cwd ?? SessionCwd.get(ctx.sessionID)
+          let search = params.path ?? effectiveCwd
+          search = path.isAbsolute(search) ? search : path.resolve(effectiveCwd, search)
           const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
           if (info?.type === "File") {
             throw new Error(`glob path must be a directory: ${search}`)

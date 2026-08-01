@@ -16,6 +16,7 @@ import { Filesystem } from "../../src/util"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderTest } from "../fake/provider"
+import { RESOLVED_READ_PATH_METADATA_KEY } from "../../src/tool/read-state"
 
 const FIXTURES_DIR = path.join(import.meta.dir, "fixtures")
 
@@ -131,6 +132,18 @@ const asks = () => {
 }
 
 describe("tool.read external_directory permission", () => {
+  it.live("records the absolute path resolved for a relative read", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const cwd = path.join(dir, "nested")
+      const filepath = path.join(cwd, "test.txt")
+      yield* put(filepath, "hello world")
+
+      const result = yield* exec(dir, { file_path: "test.txt" }, { ...ctx, cwd })
+      expect(result.metadata[RESOLVED_READ_PATH_METADATA_KEY]).toBe(full(filepath))
+    }),
+  )
+
   it.live("allows reading absolute path inside project directory", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()

@@ -16,6 +16,8 @@ export type DynamicDescription = (agent: Agent.Info) => Effect.Effect<string>
 
 export type Context<M extends Metadata = Metadata> = {
   sessionID: SessionID
+  /** Host-captured working directory for this exact tool call. */
+  cwd?: string
   messageID: MessageID
   agent: string
   actorID?: string

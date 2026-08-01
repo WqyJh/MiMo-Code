@@ -201,6 +201,12 @@ session may stop, so their `session.preStop` registration is ignored. MiMoCode
 also never executes a provider's suggested command; it only shows the argv to
 the Agent as a next-action hint.
 
+`input.cwd` is the Host-owned Session working directory. MiMoCode persists it
+with the Session and restores it after a process restart, so completion checks
+and subsequent tools continue to evaluate the same workspace. Hosts expose
+this contract as `durableSessionCwd: true` in `mimo debug capabilities` and as
+`MIMOCODE_DURABLE_SESSION_CWD=1` to child tool processes.
+
 ```ts title="~/.config/mimocode/hooks/release-gate.ts"
 import type { Plugin } from "@mimo-ai/plugin"
 import { join } from "node:path"
@@ -247,6 +253,15 @@ final prose. MiMoCode bounds repeated continuation checks and gives the Agent
 one final turn to report a non-progressing blocker, preventing an infinite
 paid-model loop.
 
+MiMoCode remembers trusted file providers so an accidental deletion remains
+fail-closed. To intentionally uninstall one, remove its hook file and then run
+`mimo debug completion-providers forget --file /absolute/path/to/hook.ts`.
+The command refuses a provider that is still active, accepts only the exact
+absolute file identity requested, and never unregisters other providers. It
+may also forget an existing provider file whose module no longer exports
+`session.preStop`, which is how an administrator recovers from an invalid hot
+update without weakening unrelated completion policy.
+
 #### Todo Events
 
 - `todo.updated`
@@ -259,6 +274,11 @@ paid-model loop.
 
 - `tool.execute.after`
 - `tool.execute.before`
+
+Both tool events receive `input.cwd`, the Host-captured working-directory
+snapshot used by that exact tool call. The before hook, built-in tool execution,
+and after hook share the same snapshot even when another concurrent tool
+changes the session working directory.
 
 #### TUI Events
 

@@ -13,6 +13,7 @@ import { SessionCwd } from "./session-cwd"
 import { Instruction } from "../session/instruction"
 import { Provider } from "@/provider"
 import { isImageAttachment, isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { RESOLVED_READ_PATH_METADATA_KEY } from "./read-state"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -150,7 +151,7 @@ export const ReadTool = Tool.define(
 
       let filepath = params.file_path
       if (!path.isAbsolute(filepath)) {
-        filepath = path.resolve(SessionCwd.get(ctx.sessionID), filepath)
+        filepath = path.resolve(ctx.cwd ?? SessionCwd.get(ctx.sessionID), filepath)
       }
       if (process.platform === "win32") {
         filepath = AppFileSystem.normalizePath(filepath)
@@ -199,6 +200,7 @@ export const ReadTool = Tool.define(
             `</entries>`,
           ].join("\n"),
           metadata: {
+            [RESOLVED_READ_PATH_METADATA_KEY]: filepath,
             preview: sliced.slice(0, 20).join("\n"),
             truncated,
             loaded: [] as string[],
@@ -244,7 +246,12 @@ export const ReadTool = Tool.define(
           return {
             title,
             output: warning,
-            metadata: { preview: warning, truncated: false, loaded: [] as string[] },
+            metadata: {
+              [RESOLVED_READ_PATH_METADATA_KEY]: filepath,
+              preview: warning,
+              truncated: false,
+              loaded: [] as string[],
+            },
           }
         }
         const bytes = yield* fs.readFile(filepath)
@@ -252,6 +259,7 @@ export const ReadTool = Tool.define(
           title,
           output: "Image read successfully",
           metadata: {
+            [RESOLVED_READ_PATH_METADATA_KEY]: filepath,
             preview: "Image read successfully",
             truncated: false,
             loaded: loaded.map((item) => item.filepath),
@@ -272,6 +280,7 @@ export const ReadTool = Tool.define(
           title,
           output: "PDF read successfully",
           metadata: {
+            [RESOLVED_READ_PATH_METADATA_KEY]: filepath,
             preview: "PDF read successfully",
             truncated: false,
             loaded: loaded.map((item) => item.filepath),
@@ -324,6 +333,7 @@ export const ReadTool = Tool.define(
         title,
         output,
         metadata: {
+          [RESOLVED_READ_PATH_METADATA_KEY]: filepath,
           preview: file.raw.slice(0, 20).join("\n"),
           truncated,
           loaded: loaded.map((item) => item.filepath),

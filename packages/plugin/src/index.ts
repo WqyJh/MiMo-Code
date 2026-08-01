@@ -541,6 +541,8 @@ export interface Hooks {
       callID: string
       /** Stable identity of the current visible root-main user turn, when one exists. */
       visibleUserMessageID?: string
+      /** Stable Host-resolved cwd snapshot used by this exact tool call. */
+      cwd?: string
     },
     output: { args: any; cancel?: boolean; cancelReason?: string },
   ) => Promise<void>
@@ -556,6 +558,8 @@ export interface Hooks {
       args: any
       /** Stable identity of the current visible root-main user turn, when one exists. */
       visibleUserMessageID?: string
+      /** The same stable Host-resolved cwd snapshot supplied to the before hook. */
+      cwd?: string
     },
     output: {
       title: string

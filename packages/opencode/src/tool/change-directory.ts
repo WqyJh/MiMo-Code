@@ -39,7 +39,7 @@ export const ChangeDirectoryTool = Tool.define(
       execute: (params: { path: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const ins = yield* InstanceState.context
-          const currentCwd = SessionCwd.get(ctx.sessionID)
+          const currentCwd = ctx.cwd ?? SessionCwd.get(ctx.sessionID)
 
           if (params.path === "~" || params.path === "") {
             SessionCwd.clear(ctx.sessionID)

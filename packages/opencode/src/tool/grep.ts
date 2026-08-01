@@ -45,7 +45,7 @@ export const GrepTool = Tool.define(
             },
           })
 
-          const effectiveCwd = SessionCwd.get(ctx.sessionID)
+          const effectiveCwd = ctx.cwd ?? SessionCwd.get(ctx.sessionID)
           const search = AppFileSystem.resolve(
             path.isAbsolute(params.path ?? effectiveCwd)
               ? (params.path ?? effectiveCwd)

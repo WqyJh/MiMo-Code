@@ -38,11 +38,13 @@ export const ViewImageTool = Tool.define(
           const filepath =
             process.platform === "win32"
               ? AppFileSystem.normalizePath(
-                  path.isAbsolute(params.path) ? params.path : path.resolve(SessionCwd.get(ctx.sessionID), params.path),
+                  path.isAbsolute(params.path)
+                    ? params.path
+                    : path.resolve(ctx.cwd ?? SessionCwd.get(ctx.sessionID), params.path),
                 )
               : path.isAbsolute(params.path)
                 ? params.path
-                : path.resolve(SessionCwd.get(ctx.sessionID), params.path)
+                : path.resolve(ctx.cwd ?? SessionCwd.get(ctx.sessionID), params.path)
           const stat = yield* fs.stat(filepath).pipe(Effect.catch(() => Effect.succeed(undefined)))
 
           yield* assertExternalDirectoryEffect(ctx, filepath, { kind: "file" })

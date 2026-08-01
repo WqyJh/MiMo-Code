@@ -310,6 +310,7 @@ describe("SessionPrompt session loop hooks", () => {
                 tool: string
                 sessionID: string
                 visibleUserMessageID?: string
+                cwd?: string
               },
           )
         const rootEvents = events.filter((event) => event.sessionID === rootSessionID && event.tool === "skill")
@@ -318,10 +319,12 @@ describe("SessionPrompt session loop hooks", () => {
           rootVisibleUserMessageID,
           rootVisibleUserMessageID,
         ])
+        expect(rootEvents.map(({ cwd }) => cwd)).toEqual([tmp.path, tmp.path])
 
         const childEvents = events.filter((event) => event.sessionID === childSessionID && event.tool === "skill")
         expect(childEvents.map(({ phase }) => phase)).toEqual(["before", "after"])
         expect(childEvents.every((event) => !("visibleUserMessageID" in event))).toBe(true)
+        expect(childEvents.map(({ cwd }) => cwd)).toEqual([tmp.path, tmp.path])
       } finally {
         await stub.stop()
       }
@@ -510,6 +513,114 @@ describe("SessionPrompt session loop hooks", () => {
         expect(reentry).toContain("final export is missing")
         expect(reentry).toContain("Render and verify the final export")
         expect(reentry).toContain('[\\"mimo-cut\\",\\"deliver\\",\\"--json\\"]')
+      } finally {
+        await stub.stop()
+      }
+    },
+    { timeout: 30_000 },
+  )
+
+  test(
+    "resumed tools and session.preStop restore the cwd after cold Instance recreation",
+    async () => {
+      await using tmp = await tmpdir({ git: true })
+      const nested = path.join(tmp.path, "nested")
+      await fs.promises.mkdir(nested, { recursive: true })
+      const stub = startScriptedLLMServer([
+        {
+          lines: toolCallResponse({
+            id: "call-change-directory-before-stop",
+            name: "change_directory",
+            args: JSON.stringify({ path: "nested" }),
+          }),
+        },
+        { lines: textStopResponse("completed in nested workspace") },
+        {
+          lines: toolCallResponse({
+            id: "call-pwd-after-instance-restart",
+            name: "bash",
+            args: JSON.stringify({ command: "pwd", description: "show restored cwd" }),
+          }),
+        },
+        { lines: textStopResponse("completed after restoring nested workspace") },
+      ])
+      const marker = path.join(tmp.path, "prestop-cwd.jsonl")
+      try {
+        const plugin = await writePlugin(
+          tmp.path,
+          "prestop-cwd-plugin.ts",
+          [
+            "import * as fs from 'fs/promises'",
+            `const marker = ${JSON.stringify(marker)}`,
+            "export default async () => ({",
+            '  "session.preStop": async (input, output) => {',
+            "    await fs.appendFile(marker, JSON.stringify({ cwd: input.cwd, root: input.root }) + '\\n')",
+            '    output.status = "allow"',
+            "  },",
+            "})",
+            "",
+          ].join("\n"),
+        )
+        await configureProject({ directory: tmp.path, origin: stub.origin, plugins: [plugin] })
+
+        const sessionID = await Instance.provide({
+          directory: tmp.path,
+          fn: () =>
+            run(
+              Effect.gen(function* () {
+                const sessions = yield* Session.Service
+                const prompt = yield* SessionPrompt.Service
+                const session = yield* sessions.create({ title: "pre-stop changed cwd" })
+                yield* prompt.prompt({
+                  sessionID: session.id,
+                  agent: "build",
+                  parts: [{ type: "text", text: "work inside nested and finish" }],
+                })
+                return session.id
+              }),
+            ),
+        })
+
+        // Dispose every Instance-scoped service (including SessionCwd's cache),
+        // then resume the same durable session as a cold service recreation.
+        await Instance.disposeDirectory(tmp.path)
+
+        const bashOutput = await Instance.provide({
+          directory: tmp.path,
+          fn: () =>
+            run(
+              Effect.gen(function* () {
+                const sessions = yield* Session.Service
+                const prompt = yield* SessionPrompt.Service
+                yield* prompt.prompt({
+                  sessionID,
+                  agent: "build",
+                  parts: [{ type: "text", text: "show the current cwd and finish" }],
+                })
+                const messages = yield* sessions.messages({ sessionID })
+                const bash = messages
+                  .flatMap((message) => message.parts)
+                  .find(
+                    (part) =>
+                      part.type === "tool" && part.tool === "bash" && part.state.status === "completed",
+                  )
+                if (!bash || bash.type !== "tool" || bash.state.status !== "completed") {
+                  throw new Error("expected completed bash call after session resume")
+                }
+                return bash.state.output
+              }),
+            ),
+        })
+
+        expect(bashOutput).toContain(nested)
+        const observations = (await Bun.file(marker).text())
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        expect(observations).toEqual([
+          { cwd: nested, root: tmp.path },
+          { cwd: nested, root: tmp.path },
+        ])
       } finally {
         await stub.stop()
       }

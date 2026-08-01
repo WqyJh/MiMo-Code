@@ -249,7 +249,7 @@ describe("session.preStop provider contract", () => {
           '  "session.preStop": async (_input, output) => {',
           '    output.status = "continue"',
           `    output.reason = ${JSON.stringify(`provider-${index}:`)} + "R".repeat(10_000)`,
-          `    output.nextAction = { description: ${JSON.stringify(`action-${index}:`)} + "D".repeat(2_000), command: Array.from({ length: 40 }, (_, argument) => \`arg-\${argument}-\${"C".repeat(1_000)}\`) }`,
+          `    output.nextAction = { description: ${JSON.stringify(`action-${index}:`)} + "D".repeat(2_000), command: Array.from({ length: 16 }, (_, argument) => \`arg-\${argument}\`) }`,
           "  },",
           "})",
           "",
@@ -277,6 +277,35 @@ describe("session.preStop provider contract", () => {
       expect(action.command).toHaveLength(16)
       expect(action.command?.every((argument) => Buffer.byteLength(argument) <= 256)).toBe(true)
     }
+  })
+
+  test("rejects an oversized argv argument instead of returning a corrupted command", async () => {
+    await using tmp = await pluginProject([
+      [
+        "export default async () => ({",
+        '  "session.preStop": async (_input, output) => {',
+        '    output.status = "continue"',
+        '    output.reason = "run the exact command"',
+        '    output.nextAction = { command: ["x".repeat(257)] }',
+        "  },",
+        "})",
+        "",
+      ].join("\n"),
+    ])
+
+    const decision = await Instance.provide({
+      directory: tmp.path,
+      fn: async () =>
+        Effect.gen(function* () {
+          const plugin = yield* Plugin.Service
+          return yield* plugin.triggerSessionPreStop(completionInput(tmp.path))
+        }).pipe(Effect.provide(Plugin.defaultLayer), Effect.runPromise),
+    })
+
+    expect(decision.status).toBe("blocked")
+    expect(decision.reason).toContain("completion cannot be verified")
+    expect(decision.reason).not.toContain("x".repeat(257))
+    expect(decision.nextActions).toEqual([])
   })
 
   test("enforces the per-turn continuation limit across providers that alternate continue and allow", async () => {
@@ -596,6 +625,70 @@ describe("session.preStop provider contract", () => {
     expect(afterRestart.status).toBe("blocked")
     expect(afterRestart.reason).toContain("could not be loaded")
     expect(afterRestart.contributingProviderIDs).toEqual(installed.contributingProviderIDs)
+  })
+
+  test("keeps a configured provider enrolled when a valid update drops session.preStop", async () => {
+    await using tmp = await pluginProject([
+      [
+        'import fs from "node:fs"',
+        'import { fileURLToPath } from "node:url"',
+        "export default async () => {",
+        '  if (fs.existsSync(fileURLToPath(new URL("./provider-without-prestop", import.meta.url)))) return {}',
+        "  return {",
+        '    "session.preStop": async (_input, output) => {',
+        '      output.status = "blocked"',
+        '      output.reason = "configured provider is enrolled"',
+        "    },",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    ])
+    const disabledFile = path.join(tmp.path, "provider-without-prestop")
+    const trustedConfigFile = path.join(tmp.path, "trusted-config", "mimocode.json")
+
+    const installed = await Instance.provide({
+      directory: tmp.path,
+      fn: async () =>
+        Effect.gen(function* () {
+          const plugin = yield* Plugin.Service
+          return yield* plugin.triggerSessionPreStop(completionInput(tmp.path))
+        }).pipe(Effect.provide(Plugin.defaultLayer), Effect.runPromise),
+    })
+
+    await Bun.write(disabledFile, "disabled")
+    await Instance.disposeAll()
+    const invalid = await Instance.provide({
+      directory: tmp.path,
+      fn: async () =>
+        Effect.gen(function* () {
+          const plugin = yield* Plugin.Service
+          return yield* plugin.triggerSessionPreStop(completionInput(tmp.path))
+        }).pipe(Effect.provide(Plugin.defaultLayer), Effect.runPromise),
+    })
+
+    expect(installed.status).toBe("blocked")
+    expect(invalid.status).toBe("blocked")
+    expect(invalid.reason).toContain("no longer exports session.preStop")
+    expect(invalid.reason).toContain("ask the user")
+    expect(invalid.contributingProviderIDs).toEqual(installed.contributingProviderIDs)
+
+    await Bun.write(
+      trustedConfigFile,
+      JSON.stringify({ $schema: "https://opencode.ai/config.json", plugin: [] }),
+    )
+    await Instance.disposeAll()
+    const uninstalled = await Instance.provide({
+      directory: tmp.path,
+      fn: async () =>
+        Effect.gen(function* () {
+          const plugin = yield* Plugin.Service
+          return yield* plugin.triggerSessionPreStop(completionInput(tmp.path))
+        }).pipe(Effect.provide(Plugin.defaultLayer), Effect.runPromise),
+    })
+
+    expect(uninstalled.status).toBe("allow")
+    expect(uninstalled.contributingProviderIDs).toEqual([])
   })
 
   test("caps invoked completion providers and fails closed when the registry exceeds the limit", async () => {

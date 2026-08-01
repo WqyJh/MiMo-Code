@@ -35,7 +35,7 @@ export const WriteTool = Tool.define(
         Effect.gen(function* () {
           const filepath = path.isAbsolute(params.file_path)
             ? params.file_path
-            : path.join(SessionCwd.get(ctx.sessionID), params.file_path)
+            : path.join(ctx.cwd ?? SessionCwd.get(ctx.sessionID), params.file_path)
           yield* assertWriteAllowed(ctx, filepath)
 
           const exists = yield* fs.existsSafe(filepath)

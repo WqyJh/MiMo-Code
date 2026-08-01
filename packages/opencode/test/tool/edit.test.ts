@@ -14,9 +14,11 @@ import { BusEvent } from "../../src/bus/bus-event"
 import { Truncate } from "../../src/tool"
 import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import type { MessageV2 } from "../../src/session/message-v2"
+import { RESOLVED_READ_PATH_METADATA_KEY } from "../../src/tool/read-state"
 
 const baseCtx = {
   sessionID: SessionID.make("ses_test-edit-session"),
+  cwd: undefined as string | undefined,
   messageID: MessageID.make(""),
   callID: "",
   agent: "build",
@@ -28,7 +30,7 @@ const baseCtx = {
 
 type EditCtx = typeof baseCtx
 
-function withRead(filePath: string, ctx: EditCtx = baseCtx): EditCtx {
+function withRead(filePath: string, ctx: EditCtx = baseCtx, resolvedPath?: string): EditCtx {
   const messageID = MessageID.make("msg_read")
   return {
     ...ctx,
@@ -52,7 +54,7 @@ function withRead(filePath: string, ctx: EditCtx = baseCtx): EditCtx {
               input: { file_path: filePath },
               output: "",
               title: `Read ${filePath}`,
-              metadata: {},
+              metadata: resolvedPath ? { [RESOLVED_READ_PATH_METADATA_KEY]: resolvedPath } : {},
               time: { start: 0, end: 0 },
             },
           },
@@ -194,6 +196,74 @@ describe("tool.edit", () => {
   })
 
   describe("editing existing files", () => {
+    test("does not reinterpret a historical relative read after the session cwd changes", async () => {
+      await using tmp = await tmpdir()
+      const nested = path.join(tmp.path, "nested")
+      const rootFile = path.join(tmp.path, "config.txt")
+      const nestedFile = path.join(nested, "config.txt")
+      await fs.mkdir(nested, { recursive: true })
+      await fs.writeFile(rootFile, "root content", "utf-8")
+      await fs.writeFile(nestedFile, "nested content", "utf-8")
+
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const edit = await resolve()
+          const changedCwdCtx = {
+            ...withRead("config.txt", { ...baseCtx, cwd: nested }, rootFile),
+            cwd: nested,
+          }
+
+          await expect(
+            Effect.runPromise(
+              edit.execute(
+                {
+                  file_path: "config.txt",
+                  old_string: "nested content",
+                  new_string: "changed",
+                },
+                changedCwdCtx,
+              ),
+            ),
+          ).rejects.toThrow("has not been read")
+
+          expect(await fs.readFile(nestedFile, "utf-8")).toBe("nested content")
+        },
+      })
+    })
+
+    test("accepts a historical relative read recorded for the edit target", async () => {
+      await using tmp = await tmpdir()
+      const nested = path.join(tmp.path, "nested")
+      const nestedFile = path.join(nested, "config.txt")
+      await fs.mkdir(nested, { recursive: true })
+      await fs.writeFile(nestedFile, "nested content", "utf-8")
+
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const edit = await resolve()
+          const changedCwdCtx = {
+            ...withRead("config.txt", { ...baseCtx, cwd: nested }, nestedFile),
+            cwd: nested,
+          }
+
+          await Effect.runPromise(
+            edit.execute(
+              {
+                file_path: "config.txt",
+                old_string: "nested content",
+                new_string: "changed",
+              },
+              changedCwdCtx,
+            ),
+          )
+
+          expect(await fs.readFile(nestedFile, "utf-8")).toBe("changed")
+        },
+      })
+    })
+
     test("replaces text in existing file", async () => {
       await using tmp = await tmpdir()
       const filepath = path.join(tmp.path, "existing.txt")

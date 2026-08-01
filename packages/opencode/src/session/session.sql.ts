@@ -25,6 +25,11 @@ export const SessionTable = sqliteTable(
     context_watermark: text().$type<MessageID>(),
     slug: text().notNull(),
     directory: text().notNull(),
+    // Mutable working directory selected by change_directory. Unlike
+    // `directory` (the immutable session/Instance root), this may be reset to
+    // null. Keeping it on the session row makes resume/restart recovery use the
+    // same authority and lifecycle as the session itself.
+    cwd: text(),
     title: text().notNull(),
     version: text().notNull(),
     share_url: text(),

@@ -111,6 +111,9 @@ const cli = yargs(args)
     process.env.AGENT = "1"
     process.env.MIMOCODE = "1"
     process.env.MIMOCODE_PID = String(process.pid)
+    process.env.MIMOCODE_SESSION_PRESTOP = "1"
+    process.env.MIMOCODE_TOOL_HOOK_HOST_CWD = "1"
+    process.env.MIMOCODE_DURABLE_SESSION_CWD = "1"
 
     Log.Default.info("mimocode", {
       version: InstallationVersion,

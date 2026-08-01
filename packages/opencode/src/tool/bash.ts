@@ -838,7 +838,7 @@ export const BashTool = Tool.define(
           parameters: Parameters,
           execute: (params: z.infer<typeof Parameters>, ctx: Tool.Context) =>
             Effect.gen(function* () {
-              const effectiveCwd = SessionCwd.get(ctx.sessionID)
+              const effectiveCwd = ctx.cwd ?? SessionCwd.get(ctx.sessionID)
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, effectiveCwd, shell)
                 : effectiveCwd

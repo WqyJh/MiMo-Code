@@ -120,6 +120,8 @@ type HookEntry = {
   completionRevision: string
   /** Whether this entry may authoritatively decide root-session completion. */
   completionTrusted: boolean
+  /** Synthetic fail-closed stand-in for an enrolled provider that is unavailable. */
+  completionUnavailable: boolean
 }
 
 type State = {
@@ -253,6 +255,13 @@ function completionFileHookKey(canonicalFile: string, canonicalScope: string) {
   return `${canonicalScope}\0${canonicalFile}`
 }
 
+function completionFileLexicalScope(filePath: string) {
+  // FILE_HOOK_GLOB only admits <scope>/{hook,hooks}/<file>. Deriving the
+  // scope from the persisted lexical file path lets legacy realpath-based
+  // records migrate even when the configured scope itself is a symlink.
+  return path.dirname(path.dirname(path.resolve(filePath)))
+}
+
 function completionProviderRegistryFile() {
   const root = Flag.MIMOCODE_CONFIG_DIR
     ? path.join(path.resolve(Flag.MIMOCODE_CONFIG_DIR), ".mimocode-state")
@@ -283,7 +292,31 @@ async function readCompletionProviderRegistry(file = completionProviderRegistryF
   if (source === undefined) {
     return { version: 1, providers: [] } satisfies CompletionProviderRegistry
   }
-  return CompletionProviderRegistrySchema.parse(JSON.parse(source))
+  return normalizeCompletionProviderRegistry(CompletionProviderRegistrySchema.parse(JSON.parse(source)))
+}
+
+function normalizeCompletionProviderRegistry(registry: CompletionProviderRegistry): CompletionProviderRegistry {
+  return {
+    version: 1,
+    providers: deduplicateCompletionProviderRecords(
+      registry.providers.map((record) =>
+        record.kind === "file"
+          ? (() => {
+              const filePath = path.resolve(record.filePath)
+              return {
+                ...record,
+                filePath,
+                // The configured hook path and scope are the durable identity.
+                // realpath is deliberately excluded: installers commonly use
+                // stable symlinks whose targets move between releases.
+                canonicalFile: filePath,
+                canonicalScope: completionFileLexicalScope(filePath),
+              }
+            })()
+          : record,
+      ),
+    ),
+  }
 }
 
 async function updateCompletionProviderRegistry(
@@ -291,9 +324,20 @@ async function updateCompletionProviderRegistry(
 ) {
   const file = completionProviderRegistryFile()
   return Flock.withLock(`completion-provider-registry:${file}`, async () => {
-    const current = await readCompletionProviderRegistry(file)
+    const source = await Filesystem.readText(file).catch((error) => {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined
+      throw error
+    })
+    const stored =
+      source === undefined
+        ? ({ version: 1, providers: [] } satisfies CompletionProviderRegistry)
+        : CompletionProviderRegistrySchema.parse(JSON.parse(source))
+    const current = normalizeCompletionProviderRegistry(stored)
     const next = CompletionProviderRegistrySchema.parse(update(current))
-    if (JSON.stringify(current) === JSON.stringify(next)) return next
+    // Compare against the on-disk representation so legacy realpath-based file
+    // records are actually migrated, rather than normalized only in memory on
+    // every process start.
+    if (JSON.stringify(stored) === JSON.stringify(next)) return next
 
     await fs.promises.mkdir(path.dirname(file), { recursive: true })
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
@@ -325,6 +369,7 @@ function hookEntry(input: {
   completionIdentity: string[]
   completionRevision?: string
   completionTrusted: boolean
+  completionUnavailable?: boolean
 }): HookEntry {
   const providerID = completionProviderID(...input.completionIdentity)
   return {
@@ -335,6 +380,7 @@ function hookEntry(input: {
     completionIdentity: input.completionIdentity,
     completionRevision: input.completionRevision ?? providerID,
     completionTrusted: input.completionTrusted,
+    completionUnavailable: input.completionUnavailable ?? false,
   }
 }
 
@@ -385,7 +431,9 @@ export interface Interface {
   ) => Effect.Effect<Output>
   readonly list: () => Effect.Effect<Hooks[]>
   readonly init: () => Effect.Effect<void>
-  readonly reloadFileHooks: (options?: { forgetMissingCompletionProviders?: boolean }) => Effect.Effect<void>
+  readonly reloadFileHooks: (options?: {
+    forgetMissingCompletionProviderFile?: string
+  }) => Effect.Effect<{ forgotten: boolean }>
   readonly triggerActorPreStop: (input: ActorPreStopInput) => Effect.Effect<ActorStopAggregatedDecision>
   readonly triggerActorPostStop: (input: ActorPostStopInput) => Effect.Effect<ActorStopAggregatedDecision>
   readonly triggerSessionPreStop: (input: SessionPreStopHostInput) => Effect.Effect<SessionPreStopAggregatedDecision>
@@ -519,7 +567,7 @@ async function applyPlugin(
 function unavailableCompletionHook(input: {
   completionIdentity: string[]
   pluginName: string
-  state: "missing" | "unloadable" | "registry"
+  state: "missing" | "unloadable" | "invalid" | "registry"
 }) {
   const providerID = completionProviderID(...input.completionIdentity)
   const hook: Hooks = {
@@ -527,8 +575,10 @@ function unavailableCompletionHook(input: {
       output.status = "blocked"
       output.reason =
         input.state === "registry"
-          ? "The authoritative completion-provider registry could not be read or updated; completion cannot be verified. Inspect local MiMoCode logs."
-          : `Required completion provider ${providerID} could not be loaded; completion cannot be verified. Inspect local MiMoCode logs.`
+          ? "The authoritative completion-provider registry could not be read or updated; completion cannot be verified. User action is required: ask the user to inspect local MiMoCode logs."
+          : input.state === "invalid"
+            ? `Required completion provider ${providerID} no longer exports session.preStop; completion cannot be verified. Restore the provider or ask the user to remove it through the administrator control plane.`
+            : `Required completion provider ${providerID} could not be loaded; completion cannot be verified. User action is required: restore the provider or ask the user to remove it through the administrator control plane.`
     },
   }
   return {
@@ -542,6 +592,7 @@ function unavailableCompletionHook(input: {
         .update(`\0${input.state}`)
         .digest("hex"),
       completionTrusted: true,
+      completionUnavailable: true,
     }),
   }
 }
@@ -788,8 +839,7 @@ export const layer = Layer.effect(
                   ...current.providers.filter(
                     (record): record is ConfiguredCompletionProvider =>
                       record.kind === "configured" &&
-                      activeConfiguredCompletionIdentities.has(record.configIdentity) &&
-                      !successfullyLoadedConfiguredIdentities.has(record.configIdentity),
+                      activeConfiguredCompletionIdentities.has(record.configIdentity),
                   ),
                   ...liveConfiguredCompletionProviders,
                 ]),
@@ -814,7 +864,7 @@ export const layer = Layer.effect(
               const unavailable = unavailableCompletionHook({
                 completionIdentity: record.completionIdentity,
                 pluginName: record.pluginName,
-                state: "unloadable",
+                state: successfullyLoadedConfiguredIdentities.has(record.configIdentity) ? "invalid" : "unloadable",
               })
               hooksWithMeta.push(unavailable.entry)
               log.error("registered fail-closed completion provider for unavailable configured plugin", {
@@ -904,7 +954,7 @@ export const layer = Layer.effect(
         const registerUnavailableCompletionHook = (
           known: KnownCompletionFileHook,
           _completionRevision: string,
-          state: "missing" | "unloadable",
+          state: "missing" | "unloadable" | "invalid",
         ) => {
           const identity = ["file", known.canonicalFile, known.canonicalScope]
           const providerID = completionProviderID(...identity)
@@ -923,12 +973,16 @@ export const layer = Layer.effect(
         }
 
         for (const dir of dirs) {
-          const canonicalScope = yield* Effect.promise(() => canonicalizePath(dir))
-          const completionTrusted = trustedDirs.has(canonicalScope)
+          const resolvedScope = yield* Effect.promise(() => canonicalizePath(dir))
+          const canonicalScope = path.resolve(dir)
+          const completionTrusted = trustedDirs.has(resolvedScope)
           if (completionTrusted) activeTrustedScopes.add(canonicalScope)
           const matches = Glob.scanSync(FILE_HOOK_GLOB, { cwd: dir, absolute: true, dot: true, symlink: true })
           for (const match of matches) {
-            const canonicalFile = yield* Effect.promise(() => canonicalizePath(match))
+            // Use the stable configured path, not its current realpath target.
+            // A symlink retarget is a provider implementation update, not an
+            // uninstall plus a permanently-missing second provider.
+            const canonicalFile = path.resolve(match)
             const name = path.basename(match, path.extname(match))
             const identity = ["file", canonicalFile, canonicalScope]
             const completionKey = completionFileHookKey(canonicalFile, canonicalScope)
@@ -999,8 +1053,17 @@ export const layer = Layer.effect(
               continue
             }
             if (completionTrusted) {
-              if (hookObj["session.preStop"]) knownCompletionFileHooks.set(completionKey, known)
-              else knownCompletionFileHooks.delete(completionKey)
+              if (hookObj["session.preStop"]) {
+                knownCompletionFileHooks.set(completionKey, known)
+              } else if (knownCompletionFileHooks.has(completionKey) || declaresSessionPreStop) {
+                // Enrollment is durable policy, not a fresh inference from the
+                // current module shape. A valid hot update that accidentally
+                // drops session.preStop must therefore fail closed across this
+                // reload and future process restarts. Only the explicit forget
+                // command is allowed to remove the persisted enrollment.
+                knownCompletionFileHooks.set(completionKey, known)
+                registerUnavailableCompletionHook(known, completionRevision, "invalid")
+              }
             }
             hooks.push(hookObj)
             const entry = hookEntry({
@@ -1026,7 +1089,7 @@ export const layer = Layer.effect(
         // deletion. Neither event may silently remove an installed completion
         // policy. Keep a tombstone provider until the file returns, the trusted
         // scope is removed from config, or an administrator explicitly forgets
-        // missing providers through reloadFileHooks().
+        // the provider through reloadFileHooks().
         for (const [key, known] of knownCompletionFileHooks) {
           if (seenCompletionFileHooks.has(key)) continue
           if (!activeTrustedScopes.has(known.canonicalScope)) {
@@ -1387,12 +1450,27 @@ export const layer = Layer.effect(
       ) {
         throw new TypeError("session.preStop nextAction.command must be a string array")
       }
+      if ((output.nextAction?.command?.length ?? 0) > SESSION_PRESTOP_MAX_COMMAND_ARGS) {
+        throw new TypeError(
+          `session.preStop nextAction.command exceeds ${SESSION_PRESTOP_MAX_COMMAND_ARGS} arguments`,
+        )
+      }
+      if (
+        output.nextAction?.command?.some(
+          (argument) => Buffer.byteLength(argument) > SESSION_PRESTOP_MAX_COMMAND_ARG_BYTES,
+        )
+      ) {
+        // An argv hint must be byte-for-byte executable. Truncating JSON or a
+        // path creates a different, usually invalid command and can trap the
+        // model in a deterministic retry loop.
+        throw new TypeError(
+          `session.preStop nextAction.command argument exceeds ${SESSION_PRESTOP_MAX_COMMAND_ARG_BYTES} bytes`,
+        )
+      }
       const description = output.nextAction?.description
         ? boundedUtf8(output.nextAction.description, SESSION_PRESTOP_MAX_DESCRIPTION_BYTES)
         : undefined
-      const command = output.nextAction?.command
-        ?.slice(0, SESSION_PRESTOP_MAX_COMMAND_ARGS)
-        .map((argument) => boundedUtf8(argument, SESSION_PRESTOP_MAX_COMMAND_ARG_BYTES))
+      const command = output.nextAction?.command ? [...output.nextAction.command] : undefined
       const nextAction = description || command ? { description, command } : undefined
       return {
         status: output.status,
@@ -1749,6 +1827,13 @@ export const layer = Layer.effect(
     const CIRCUIT_BREAKER_THRESHOLD = 3
     const hookFailures = new Map<string, number>()
 
+    const deepFreeze = (value: unknown, seen = new WeakSet<object>()): void => {
+      if (typeof value !== "object" || value === null || seen.has(value)) return
+      seen.add(value)
+      for (const child of Object.values(value)) deepFreeze(child, seen)
+      Object.freeze(value)
+    }
+
     const trigger = Effect.fn("Plugin.trigger")(function* <
       Name extends TriggerName,
       Input = Parameters<Required<Hooks>[Name]>[0],
@@ -1757,16 +1842,51 @@ export const layer = Layer.effect(
       if (!name) return output
       const s = yield* InstanceState.get(state)
       const fh = yield* freshFileHooks
-
-      for (const entry of s.hooksWithMeta) {
-        const fn = entry.hook[name] as any
-        if (!fn) continue
-        yield* Effect.promise(async () => fn(input, output))
+      const toolExecuteEvent = name === "tool.execute.before" || name === "tool.execute.after"
+      const toolExecuteBefore = name === "tool.execute.before"
+      if (toolExecuteEvent && typeof input === "object" && input !== null) {
+        // sessionID/callID/cwd/visibleUserMessageID are Host evidence. Plugin
+        // code may transform output.args, but it may never rewrite the identity
+        // of the tool call that the trusted policy is evaluating.
+        Object.freeze(input)
       }
 
-      for (const entry of fh.meta) {
+      type TriggerEntry = { entry: HookEntry; file: boolean }
+      const registered: TriggerEntry[] = [
+        ...s.hooksWithMeta.map((entry) => ({ entry, file: false })),
+        ...fh.meta.map((entry) => ({ entry, file: true })),
+      ]
+      // Project/local hooks retain their transform behavior, but all transforms
+      // must settle before trusted global policy sees the final arguments.
+      const ordered = toolExecuteEvent
+        ? [
+            ...registered.filter(({ entry }) => !entry.completionTrusted),
+            ...registered.filter(({ entry }) => entry.completionTrusted),
+          ]
+        : registered
+      let stickyCancel = false
+      let stickyCancelReason: string | undefined
+      const preserveCancellation = () => {
+        if (!toolExecuteBefore || typeof output !== "object" || output === null) return
+        const candidate = output as { cancel?: boolean; cancelReason?: string }
+        if (candidate.cancel === true) {
+          stickyCancel = true
+          if (!stickyCancelReason && candidate.cancelReason) stickyCancelReason = candidate.cancelReason
+        }
+        if (!stickyCancel) return
+        candidate.cancel = true
+        if (stickyCancelReason) candidate.cancelReason = stickyCancelReason
+      }
+      preserveCancellation()
+
+      for (const { entry, file } of ordered) {
         const fn = entry.hook[name] as any
         if (!fn) continue
+        if (!file) {
+          yield* Effect.promise(async () => fn(input, output))
+          preserveCancellation()
+          continue
+        }
         const hookID = entry.hookIDFor(name)
 
         if ((hookFailures.get(hookID) ?? 0) >= CIRCUIT_BREAKER_THRESHOLD) {
@@ -1802,6 +1922,15 @@ export const layer = Layer.effect(
           }),
         )
         if (!failed) hookFailures.delete(hookID)
+        preserveCancellation()
+      }
+      if (toolExecuteBefore && typeof output === "object" && output !== null) {
+        preserveCancellation()
+        // Hooks may retain references and schedule later mutations. Freeze the
+        // final JSON arguments and envelope so the exact arguments approved by
+        // trusted policy are the arguments the tool executes.
+        deepFreeze((output as { args?: unknown }).args)
+        Object.freeze(output)
       }
       return output
     })
@@ -1817,32 +1946,66 @@ export const layer = Layer.effect(
     })
 
     const reloadFileHooks: Interface["reloadFileHooks"] = Effect.fn("Plugin.reloadFileHooks")(function* (options) {
-      clearFileHookSessionPreStopProgress((yield* InstanceState.get(fileHookState)).meta)
-      if (options?.forgetMissingCompletionProviders) {
-        yield* Effect.promise(async () => {
+      const current = yield* InstanceState.get(fileHookState)
+      let forgotten = false
+      if (options?.forgetMissingCompletionProviderFile) {
+        if (!path.isAbsolute(options.forgetMissingCompletionProviderFile)) {
+          return yield* Effect.die(new Error("Completion provider file must be an absolute path"))
+        }
+        const requestedFile = path.resolve(options.forgetMissingCompletionProviderFile)
+        forgotten = yield* Effect.promise(async () => {
           const registry = await readCompletionProviderRegistry()
-          const missing = new Set(
-            (
-              await Promise.all(
-                registry.providers
-                  .filter((record): record is FileCompletionProvider => record.kind === "file")
-                  .map(async (record) => {
-                    const exists = await fs.promises.stat(record.filePath).catch(() => undefined)
-                    return exists ? undefined : completionProviderRecordKey(record)
-                  }),
+          const matching = new Set(
+            registry.providers
+              .filter(
+                (record): record is FileCompletionProvider =>
+                  record.kind === "file" && record.canonicalFile === requestedFile,
               )
-            ).filter((key): key is string => key !== undefined),
+              .map(completionProviderRecordKey),
           )
-          if (missing.size === 0) return
+          if (matching.size === 0) return false
+          const matchingProviderIDs = new Set(
+            registry.providers
+              .filter(
+                (record): record is FileCompletionProvider =>
+                  record.kind === "file" && matching.has(completionProviderRecordKey(record)),
+              )
+              .map((record) => completionProviderID("file", record.canonicalFile, record.canonicalScope)),
+          )
+          const activeProvider = current.meta.find(
+            (entry) =>
+              matchingProviderIDs.has(entry.completionProviderID) &&
+              !entry.completionUnavailable &&
+              !!entry.hook["session.preStop"],
+          )
+          const fileExists = await fs.promises.stat(requestedFile).then(
+            () => true,
+            (error) => {
+              if (
+                error instanceof Error &&
+                "code" in error &&
+                (error.code === "ENOENT" || error.code === "ENOTDIR")
+              ) {
+                return false
+              }
+              throw error
+            },
+          )
+          if (fileExists && activeProvider) {
+            throw new Error(`Refusing to forget an active completion provider file: ${requestedFile}`)
+          }
           await updateCompletionProviderRegistry((current) => ({
             version: 1,
             providers: current.providers.filter(
-              (record) => record.kind !== "file" || !missing.has(completionProviderRecordKey(record)),
+              (record) => record.kind !== "file" || !matching.has(completionProviderRecordKey(record)),
             ),
           }))
+          return true
         })
       }
+      clearFileHookSessionPreStopProgress(current.meta)
       yield* InstanceState.invalidate(fileHookState)
+      return { forgotten }
     })
 
     return Service.of({

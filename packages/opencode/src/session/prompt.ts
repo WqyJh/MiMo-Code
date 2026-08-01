@@ -87,6 +87,7 @@ import { spawnRef } from "@/actor/spawn-ref"
 import { Inbox } from "@/inbox"
 import { sessionPromptRef, defaultModelRef } from "@/inbox/inbox-ref"
 import { Tool } from "@/tool"
+import { SessionCwd } from "@/tool/session-cwd"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
@@ -1242,8 +1243,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         metadata: { rejected: true, reason: "tool-whitelist" as const },
       })
 
-      const context = (args: any, options: ToolExecutionOptions): Tool.Context => ({
+      const context = (args: any, options: ToolExecutionOptions, cwd: string): Tool.Context => ({
         sessionID: input.session.id,
+        cwd,
         abort: options.abortSignal!,
         messageID: input.processor.message.id,
         callID: options.toolCallId,
@@ -1312,7 +1314,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   callID,
                   sessionID: input.session.id,
                 })
-                const ctx = context(args, options)
+                const toolCwd = SessionCwd.get(input.session.id)
+                const ctx = context(args, options, toolCwd)
                 if (whitelist && !whitelist.has(item.id) && item.id !== MCP_TOOL_SEARCH_ID) {
                   const output = rejectionFor(item.id)
                   log.debug("tool execute rejected", {
@@ -1326,7 +1329,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 const beforeOutput: { args: any; cancel?: boolean; cancelReason?: string } = { args }
                 yield* plugin.trigger(
                   "tool.execute.before",
-                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, ...toolHookTurn },
+                  {
+                    tool: item.id,
+                    sessionID: ctx.sessionID,
+                    callID: ctx.callID,
+                    cwd: toolCwd,
+                    ...toolHookTurn,
+                  },
                   beforeOutput,
                 )
                 if (beforeOutput.cancel) {
@@ -1371,6 +1380,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     sessionID: ctx.sessionID,
                     callID: ctx.callID,
                     args: beforeOutput.args,
+                    cwd: toolCwd,
                     ...toolHookTurn,
                   },
                   output,
@@ -1448,7 +1458,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 callID,
                 sessionID: input.session.id,
               })
-              const ctx = context(args, opts)
+              const toolCwd = SessionCwd.get(input.session.id)
+              const ctx = context(args, opts, toolCwd)
               if (!useMcpToolSearch && (!available || !input.model.capabilities.toolcall)) {
                 return yield* Effect.fail(
                   new RecoverableError(`The MCP tool "${key}" is unavailable for this request.`),
@@ -1481,7 +1492,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const mcpBeforeOutput: { args: any; cancel?: boolean; cancelReason?: string } = { args }
               yield* plugin.trigger(
                 "tool.execute.before",
-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, ...toolHookTurn },
+                {
+                  tool: key,
+                  sessionID: ctx.sessionID,
+                  callID: opts.toolCallId,
+                  cwd: toolCwd,
+                  ...toolHookTurn,
+                },
                 mcpBeforeOutput,
               )
               if (mcpBeforeOutput.cancel) {
@@ -1508,7 +1525,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               )
               yield* plugin.trigger(
                 "tool.execute.after",
-                { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args, ...toolHookTurn },
+                {
+                  tool: key,
+                  sessionID: ctx.sessionID,
+                  callID: opts.toolCallId,
+                  args: mcpBeforeOutput.args,
+                  cwd: toolCwd,
+                  ...toolHookTurn,
+                },
                 result,
               )
 
@@ -1686,6 +1710,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           command: task.command,
         },
       }
+      const toolCwd = SessionCwd.get(sessionID)
       let part: MessageV2.ToolPart = yield* sessions.updatePart({
         id: PartID.ascending(),
         messageID: assistantMessage.id,
@@ -1701,7 +1726,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       })
       yield* plugin.trigger(
         "tool.execute.before",
-        { tool: ActorTool.id, sessionID, callID: part.id },
+        {
+          tool: ActorTool.id,
+          sessionID,
+          callID: part.id,
+          cwd: toolCwd,
+        },
         { args: taskArgs },
       )
 
@@ -1721,6 +1751,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           agent: task.agent,
           messageID: assistantMessage.id,
           sessionID,
+          cwd: toolCwd,
           abort: taskAbort.signal,
           callID: part.callID,
           extra: { bypassAgentCheck: true, promptOps },
@@ -1780,7 +1811,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: ActorTool.id, sessionID, callID: part.id, args: taskArgs },
+        {
+          tool: ActorTool.id,
+          sessionID,
+          callID: part.id,
+          args: taskArgs,
+          cwd: toolCwd,
+        },
         result,
       )
 
@@ -2834,7 +2871,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const decision = yield* plugin.triggerSessionPreStop({
             sessionID,
             agentID: resolvedAgentID,
-            cwd: input.assistant.path?.cwd ?? ctx.directory,
+            // Assistant.path is the instance root captured when the model step
+            // starts. A successful change_directory call may move the session
+            // after that snapshot, so completion providers must inspect the
+            // session's current task workspace at the actual stop boundary.
+            cwd: SessionCwd.get(sessionID),
             root: input.assistant.path?.root ?? ctx.worktree,
             taskId: task_id,
             finalText: assistantFinalText(input.assistant, input.parts),
